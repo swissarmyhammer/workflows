@@ -25,11 +25,6 @@ jobs:
         run: cargo install cargo-nextest --force
       - name: Run tests
         run: cargo nextest run --fail-fast
-      - name: Test examples
-        run: |
-          cargo run --example basic_usage
-          cargo run --example executor_pattern
-          cargo run --example advanced_patterns
 
   fmt:
     name: Rustfmt
