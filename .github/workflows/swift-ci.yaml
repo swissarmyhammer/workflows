@@ -1,0 +1,35 @@
+name: Swift CI
+
+on:
+  workflow_call:
+    inputs:
+      developer-dir:
+        description: >
+          Path to an Xcode.app/Contents/Developer to export as DEVELOPER_DIR
+          before building (e.g. for projects that need a beta Xcode with a
+          newer Metal toolchain). Leave unset to use the runner's default.
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  test:
+    name: Build & test
+    runs-on: [self-hosted, macOS]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure DEVELOPER_DIR
+        if: inputs.developer-dir != ''
+        run: echo "DEVELOPER_DIR=${{ inputs.developer-dir }}" >> "$GITHUB_ENV"
+
+      - name: Toolchain versions
+        run: |
+          sw_vers
+          swift --version
+
+      - name: Build (incl. tests)
+        run: swift build --build-tests
+
+      - name: Run tests
+        run: swift test
