@@ -11,6 +11,33 @@ on:
         required: false
         type: string
         default: ""
+      integration-gate-env:
+        description: >
+          Name of an env var to set to 1 to unlock a gated, opt-in
+          integration suite that depends on real external resources (models,
+          network, GPU). Leave empty to skip the integration job entirely.
+          Only runs when the caller's triggering event is workflow_dispatch.
+        required: false
+        type: string
+        default: ""
+      integration-xctest-glob:
+        description: >
+          find(1) -path glob, relative to .build, locating the integration
+          suite's .xctest bundle (e.g. '*IntegrationTests.xctest'). Required
+          when integration-gate-env is set.
+        required: false
+        type: string
+        default: ""
+      integration-metallib-glob:
+        description: >
+          Optional find(1) -path glob, relative to .build, locating an
+          mlx-swift default.metallib to copy next to the xctest bundle
+          before running it (e.g. '*Cmlx*/default.metallib'). Works around
+          `swift test`/xctest failing to load it under SwiftPM. Leave empty
+          if the integration suite doesn't depend on mlx-swift.
+        required: false
+        type: string
+        default: ""
 
 jobs:
   test:
@@ -33,3 +60,33 @@ jobs:
 
       - name: Run tests
         run: swift test
+
+  integration:
+    name: Integration (opt-in, real dependencies)
+    if: inputs.integration-gate-env != '' && github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, macOS]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure DEVELOPER_DIR
+        if: inputs.developer-dir != ''
+        run: echo "DEVELOPER_DIR=${{ inputs.developer-dir }}" >> "$GITHUB_ENV"
+
+      - name: Build tests
+        run: swift build --build-tests
+
+      - name: Run gated integration suite
+        run: |
+          set -euo pipefail
+          XCTEST="$(find .build -path '${{ inputs.integration-xctest-glob }}' -type d | head -n 1)"
+          echo "xctest: ${XCTEST:?not found}"
+
+          METALLIB_GLOB='${{ inputs.integration-metallib-glob }}'
+          if [ -n "$METALLIB_GLOB" ]; then
+            METALLIB="$(find .build -path "$METALLIB_GLOB" | head -n 1)"
+            echo "metallib: ${METALLIB:?not found}"
+            cp "$METALLIB" "$XCTEST/Contents/MacOS/" 2>/dev/null \
+              || cp "$METALLIB" "$(dirname "$XCTEST")/"
+          fi
+
+          ${{ inputs.integration-gate-env }}=1 xcrun xctest "$XCTEST"
