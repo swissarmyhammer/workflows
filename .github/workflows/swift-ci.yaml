@@ -38,6 +38,42 @@ on:
         required: false
         type: string
         default: ""
+      example-targets:
+        description: >
+          Whitespace-separated list of additional executable target names to
+          build individually via `swift build --target <name>`, on top of the
+          whole-package `swift build --build-tests` above (e.g. for a set of
+          Examples/ targets whose per-target compilation is itself an
+          acceptance criterion). Leave empty to skip.
+        required: false
+        type: string
+        default: ""
+      docc-target:
+        description: >
+          Name of a library target to build a DocC catalog for via
+          swift-docc-plugin's `generate-documentation --warnings-as-errors`
+          (promotes DocC's own diagnostics — unresolved ``symbol``
+          cross-references, malformed directives — to build failures). The
+          calling package must declare a dependency on
+          `swiftlang/swift-docc-plugin` itself; this workflow only invokes the
+          plugin. Leave empty to skip DocC entirely.
+        required: false
+        type: string
+        default: ""
+      docc-coverage-script:
+        description: >
+          Path, relative to the repository root, to a script that enforces
+          zero missing-documentation warnings against the report produced by
+          `generate-documentation --experimental-documentation-coverage`
+          (DocC has no built-in "undocumented symbol" warning class, so
+          --warnings-as-errors above has nothing to promote for that case —
+          this is the actual enforcement mechanism). Invoked as
+          `<script> <coverage-report-path>` and expected to exit non-zero on
+          a coverage gap. Only meaningful alongside docc-target; leave empty
+          to build DocC without coverage enforcement.
+        required: false
+        type: string
+        default: ""
 
 jobs:
   test:
@@ -60,6 +96,29 @@ jobs:
 
       - name: Run tests
         run: swift test
+
+      - name: Build additional example targets
+        if: inputs.example-targets != ''
+        run: |
+          set -euo pipefail
+          for target in ${{ inputs.example-targets }}; do
+            echo "::group::swift build --target $target"
+            swift build --target "$target"
+            echo "::endgroup::"
+          done
+
+      - name: DocC build
+        if: inputs.docc-target != ''
+        run: swift package generate-documentation --target ${{ inputs.docc-target }} --warnings-as-errors
+
+      - name: DocC documentation coverage
+        if: inputs.docc-target != '' && inputs.docc-coverage-script != ''
+        run: |
+          set -euo pipefail
+          swift package generate-documentation --target ${{ inputs.docc-target }} \
+            --experimental-documentation-coverage --coverage-summary-level detailed \
+            > docc-coverage.txt
+          python3 ${{ inputs.docc-coverage-script }} docc-coverage.txt
 
   integration:
     name: Integration (opt-in, real dependencies)
