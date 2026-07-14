@@ -91,6 +91,9 @@ jobs:
           sw_vers
           swift --version
 
+      - name: Clean build directory
+        run: rm -rf .build
+
       - name: Build (incl. tests)
         run: swift build --build-tests
 
@@ -130,6 +133,9 @@ jobs:
       - name: Configure DEVELOPER_DIR
         if: inputs.developer-dir != ''
         run: echo "DEVELOPER_DIR=${{ inputs.developer-dir }}" >> "$GITHUB_ENV"
+
+      - name: Clean build directory
+        run: rm -rf .build
 
       - name: Build tests
         run: swift build --build-tests
