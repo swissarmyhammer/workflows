@@ -16,7 +16,8 @@ on:
           Name of an env var to set to 1 to unlock a gated, opt-in
           integration suite that depends on real external resources (models,
           network, GPU). Leave empty to skip the integration job entirely.
-          Only runs when the caller's triggering event is workflow_dispatch.
+          Runs on every trigger (push, pull_request, workflow_dispatch) once
+          set, same as the unit test job.
         required: false
         type: string
         default: ""
@@ -125,7 +126,7 @@ jobs:
 
   integration:
     name: Integration (opt-in, real dependencies)
-    if: inputs.integration-gate-env != '' && github.event_name == 'workflow_dispatch'
+    if: inputs.integration-gate-env != ''
     runs-on: [self-hosted, macOS]
     steps:
       - uses: actions/checkout@v4
