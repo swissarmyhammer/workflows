@@ -73,36 +73,33 @@ jobs:
 
 Put the integration suite in its own package, for example
 `IntegrationTests/Package.swift`, which depends on the root package by a
-path. Run the suite with `swift test --package-path IntegrationTests`. The
-repository keeps its own integration job, and can call `swift-ci.yaml` for
-the unit tests.
+path. Set `integration-package-path`, and the integration job builds that
+package and runs `swift test --package-path` on it. `integration-filter`,
+`integration-skip` and `integration-no-parallel` apply to that run.
 
-Two requirements apply to this shape:
+The workflow enforces the two requirements of this shape:
 
-- CI builds the integration package on EVERY run. The root build does not
-  compile these tests. Without this build step, the tests can break between
-  runs, and no run shows the breakage.
-- The integration job runs after the unit job. Set a `needs:` edge in the
-  repository workflow.
+- The unit job builds the integration package on EVERY run. The root build
+  does not compile these tests. Without this build step, the tests can break
+  between runs, and no run shows the breakage.
+- The integration job runs after the unit job, through `needs:`.
 
 ```yaml
 jobs:
-  unit:
+  ci:
     uses: swissarmyhammer/workflows/.github/workflows/swift-ci.yaml@main
-
-  integration:
-    # A fast unit failure must stop the run before this job takes the runner.
-    needs: unit
-    runs-on: [self-hosted, macOS]
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build the integration package
-        run: swift build --package-path IntegrationTests --build-tests
-      - name: Run the integration tests
-        run: swift test --package-path IntegrationTests
+    with:
+      integration-package-path: IntegrationTests
+      integration-no-parallel: true
 ```
 
-If the repository gates the test run, keep the build step unconditional.
+If the integration suite depends on mlx-swift, set
+`integration-metallib-glob`. The workflow then finds the `default.metallib`
+in the package's `.build` and copies it next to each `.xctest` bundle
+before the tests run.
+
+A repository that writes its own CI steps instead of calling `swift-ci.yaml`
+must obey the same two requirements itself.
 
 ### `swift test` exits 0 when it matches nothing
 
@@ -126,12 +123,13 @@ runs `swift test` with no selectors.
 | `integration-filter` | string | `""` | `--filter` selectors for the integration job. Setting this runs the job. |
 | `integration-skip` | string | `""` | `--skip` selectors for the integration job. Setting this runs the job. |
 | `integration-no-parallel` | boolean | `false` | Give `--no-parallel` to the integration job. |
+| `integration-package-path` | string | `""` | Path to a nested integration package. Setting this runs the integration job. |
+| `integration-metallib-glob` | string | `""` | `find(1)` glob that finds a `default.metallib` to copy next to the `.xctest` bundles. |
 | `example-targets` | string | `""` | Names of more executable targets to build one by one. |
 | `docc-target` | string | `""` | Name of a library target to build a DocC catalog for. |
 | `docc-coverage-script` | string | `""` | Script that fails on a DocC coverage gap. |
 | `integration-gate-env` | string | `""` | LEGACY. Name of an environment variable that unlocks a gated suite. |
 | `integration-xctest-glob` | string | `""` | LEGACY. `find(1)` glob that finds the `.xctest` bundle. |
-| `integration-metallib-glob` | string | `""` | LEGACY. `find(1)` glob that finds a `default.metallib` to copy. |
 
 Set `test-no-parallel` or `integration-no-parallel` for a test target that lets
 only one test hold a resource at a time. Swift Testing starts the time limit of
@@ -140,19 +138,24 @@ limit on queue time, and a queued suite fails in the same way as a hang.
 
 ### The legacy integration inputs
 
-`integration-gate-env`, `integration-xctest-glob` and
-`integration-metallib-glob` stay available for the repositories that already
-use them. They have two limitations.
+`integration-gate-env` and `integration-xctest-glob` stay available for the
+repositories that already use them. They have two limitations.
 
 - They select the tests with an environment variable, not with a target.
 - Exactly ONE `.xctest` bundle runs. The workflow reads the glob with
   `head -n 1`. If the glob finds more than one bundle, only the first bundle
   runs. The other bundles do not run, and they do not report.
 
-Do not use these inputs for new work. Use `integration-filter` and
-`integration-skip`, because `swift test` runs each bundle that the selectors
-match. The workflow stops with an error if a caller gives `integration-gate-env`
-together with `integration-filter` or `integration-skip`.
+Do not use these inputs for new work. Use `integration-filter`,
+`integration-skip` or `integration-package-path`, because `swift test` runs
+each bundle that the selectors match. The workflow stops with an error if a
+caller gives `integration-gate-env` together with `integration-filter`,
+`integration-skip` or `integration-package-path`.
+
+`integration-metallib-glob` is not legacy. It works with
+`integration-package-path`, where the glob searches the nested package's
+`.build`, and it also works on the legacy `integration-gate-env` path, where
+the glob searches the root `.build`.
 
 ## The `swift-test` action
 
@@ -172,3 +175,4 @@ calling `swift-ci.yaml`.
 | `filter` | `""` | `--filter` selectors, separated by spaces or newlines. |
 | `skip` | `""` | `--skip` selectors, separated by spaces or newlines. |
 | `no-parallel` | `"false"` | Set to `true` to give `--no-parallel`. |
+| `package-path` | `""` | Path given as `--package-path`. Leave empty to test the package in the working directory. |

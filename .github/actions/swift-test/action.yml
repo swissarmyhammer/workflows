@@ -33,6 +33,14 @@ inputs:
       the same way as a hang.
     required: false
     default: "false"
+  package-path:
+    description: >
+      Path to the package to test, passed to `swift test` as
+      `--package-path`. Use this for an integration suite that lives in its
+      own nested package. Leave empty to test the package in the working
+      directory.
+    required: false
+    default: ""
 
 runs:
   using: composite
@@ -43,6 +51,7 @@ runs:
         SWIFT_TEST_FILTER: ${{ inputs.filter }}
         SWIFT_TEST_SKIP: ${{ inputs.skip }}
         SWIFT_TEST_NO_PARALLEL: ${{ inputs.no-parallel }}
+        SWIFT_TEST_PACKAGE_PATH: ${{ inputs.package-path }}
       run: |
         set -euo pipefail
 
@@ -51,6 +60,9 @@ runs:
         # lets the loop split the input on spaces, tabs and newlines.
         set -f
         args=()
+        if [ -n "${SWIFT_TEST_PACKAGE_PATH:-}" ]; then
+          args+=(--package-path "$SWIFT_TEST_PACKAGE_PATH")
+        fi
         for pattern in ${SWIFT_TEST_FILTER:-}; do args+=(--filter "$pattern"); done
         for pattern in ${SWIFT_TEST_SKIP:-}; do args+=(--skip "$pattern"); done
         set +f

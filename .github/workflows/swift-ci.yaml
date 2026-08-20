@@ -49,15 +49,16 @@ on:
         description: >
           LEGACY, kept for the repositories that already pass it. Prefer
           integration-filter and integration-skip, which select the gated
-          tests by TEST TARGET instead.
+          tests by TEST TARGET, or integration-package-path, which runs a
+          nested integration package.
 
           Name of an env var to set to 1 to unlock a gated, opt-in
           integration suite that depends on real external resources (models,
           network, GPU). Leave empty to skip the integration job entirely.
           Runs on every trigger (push, pull_request, workflow_dispatch) once
           set, same as the unit test job. Cannot be combined with
-          integration-filter or integration-skip; the job stops if both are
-          given.
+          integration-filter, integration-skip or integration-package-path;
+          the job stops if both are given.
         required: false
         type: string
         default: ""
@@ -79,13 +80,14 @@ on:
         default: ""
       integration-metallib-glob:
         description: >
-          Optional find(1) -path glob, relative to .build, locating an
-          mlx-swift default.metallib to copy next to the xctest bundle
-          before running it (e.g. '*Cmlx*/default.metallib'). Works around
-          `swift test`/xctest failing to load it under SwiftPM. Leave empty
-          if the integration suite doesn't depend on mlx-swift. Only used by
-          the legacy integration-gate-env path: the integration-filter path
-          runs the tests through `swift test`, which needs no such copy.
+          Optional find(1) -path glob locating an mlx-swift default.metallib
+          to copy next to the .xctest bundles before the tests run (e.g.
+          '*Cmlx*/default.metallib'). Works around `swift test`/xctest
+          failing to load it under SwiftPM. The glob is searched under
+          `<integration-package-path>/.build` when integration-package-path
+          is set, and under the root .build on the legacy
+          integration-gate-env path. Leave empty if the integration suite
+          does not depend on mlx-swift.
         required: false
         type: string
         default: ""
@@ -123,6 +125,21 @@ on:
         required: false
         type: boolean
         default: false
+      integration-package-path:
+        description: >
+          Path, relative to the repository root, to a nested package that
+          holds the integration suite (e.g. 'IntegrationTests') and depends
+          on the root package by a path. Setting this runs the integration
+          job: the job builds the package and runs
+          `swift test --package-path` on it, and integration-filter,
+          integration-skip and integration-no-parallel apply to that run.
+          The UNIT job also builds this package on every run, because the
+          root build does not compile a nested package, and a broken
+          integration test must not stay unseen between runs. Cannot be
+          combined with integration-gate-env.
+        required: false
+        type: string
+        default: ""
       example-targets:
         description: >
           Whitespace-separated list of additional executable target names to
@@ -196,6 +213,15 @@ jobs:
           skip: ${{ inputs.test-skip }}
           no-parallel: ${{ inputs.test-no-parallel }}
 
+      # The root build does not compile a nested integration package, so a
+      # broken integration test would stay unseen between runs. Build the
+      # package on every run.
+      - name: Build the nested integration package
+        if: inputs.integration-package-path != ''
+        run: |
+          rm -rf '${{ inputs.integration-package-path }}/.build'
+          swift build --package-path '${{ inputs.integration-package-path }}' --build-tests
+
       - name: Build additional example targets
         if: inputs.example-targets != ''
         run: |
@@ -223,12 +249,13 @@ jobs:
     name: Integration (opt-in, real dependencies)
     # A fast unit failure must stop the run before this job takes the runner.
     needs: test
-    # Either the legacy env-var gate, or the test-target selectors, runs this
-    # job.
+    # The legacy env-var gate, the test-target selectors, or a nested package
+    # path runs this job.
     if: >-
       inputs.integration-gate-env != ''
       || inputs.integration-filter != ''
       || inputs.integration-skip != ''
+      || inputs.integration-package-path != ''
     runs-on: [self-hosted, macOS]
     steps:
       - uses: actions/checkout@v4
@@ -238,9 +265,11 @@ jobs:
       - name: Reject both integration paths at once
         if: >-
           inputs.integration-gate-env != ''
-          && (inputs.integration-filter != '' || inputs.integration-skip != '')
+          && (inputs.integration-filter != ''
+              || inputs.integration-skip != ''
+              || inputs.integration-package-path != '')
         run: |
-          echo "::error::integration-gate-env cannot be combined with integration-filter or integration-skip. Use the selectors alone."
+          echo "::error::integration-gate-env cannot be combined with integration-filter, integration-skip or integration-package-path. Use the selectors or the package path alone."
           exit 1
 
       - name: Configure DEVELOPER_DIR
@@ -251,12 +280,38 @@ jobs:
         run: rm -rf .build
 
       - name: Build tests
+        if: inputs.integration-package-path == ''
         run: swift build --build-tests
+
+      # Building the nested package also compiles the root package, because
+      # the nested package depends on it by a path.
+      - name: Build the nested integration package
+        if: inputs.integration-package-path != ''
+        run: |
+          rm -rf '${{ inputs.integration-package-path }}/.build'
+          swift build --package-path '${{ inputs.integration-package-path }}' --build-tests
+
+      # mlx-swift's default.metallib does not load from the SwiftPM build
+      # layout on its own. Copy it next to each .xctest bundle of the nested
+      # package before the tests run.
+      - name: Copy the metallib into the nested package build
+        if: inputs.integration-package-path != '' && inputs.integration-metallib-glob != ''
+        run: |
+          set -euo pipefail
+          BUILD_DIR='${{ inputs.integration-package-path }}/.build'
+          METALLIB="$(find "$BUILD_DIR" -path '${{ inputs.integration-metallib-glob }}' | head -n 1)"
+          echo "metallib: ${METALLIB:?not found}"
+          find "$BUILD_DIR" -name '*.xctest' -type d | while read -r XCTEST; do
+            echo "copy beside: $XCTEST"
+            cp "$METALLIB" "$XCTEST/Contents/MacOS/" 2>/dev/null \
+              || cp "$METALLIB" "$(dirname "$XCTEST")/"
+          done
 
       - name: Run the selected integration tests
         if: inputs.integration-gate-env == ''
         uses: swissarmyhammer/workflows/.github/actions/swift-test@main
         with:
+          package-path: ${{ inputs.integration-package-path }}
           filter: ${{ inputs.integration-filter }}
           skip: ${{ inputs.integration-skip }}
           no-parallel: ${{ inputs.integration-no-parallel }}
