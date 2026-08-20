@@ -301,10 +301,18 @@ jobs:
           BUILD_DIR='${{ inputs.integration-package-path }}/.build'
           METALLIB="$(find "$BUILD_DIR" -path '${{ inputs.integration-metallib-glob }}' | head -n 1)"
           echo "metallib: ${METALLIB:?not found}"
+          # mlx probes `<binary-dir>/mlx.metallib` first (measured in
+          # FoundationModelsMultitool), and older setups read
+          # `default.metallib`. Copy the file under both names.
           find "$BUILD_DIR" -name '*.xctest' -type d | while read -r XCTEST; do
             echo "copy beside: $XCTEST"
-            cp "$METALLIB" "$XCTEST/Contents/MacOS/" 2>/dev/null \
-              || cp "$METALLIB" "$(dirname "$XCTEST")/"
+            if [ -d "$XCTEST/Contents/MacOS" ]; then
+              DEST="$XCTEST/Contents/MacOS"
+            else
+              DEST="$(dirname "$XCTEST")"
+            fi
+            cp "$METALLIB" "$DEST/default.metallib"
+            cp "$METALLIB" "$DEST/mlx.metallib"
           done
 
       - name: Run the selected integration tests
