@@ -11,13 +11,53 @@ on:
         required: false
         type: string
         default: ""
+      test-filter:
+        description: >
+          Test-target selectors to pass to `swift test` as `--filter` in the
+          unit test job, separated by spaces or by newlines. Each selector is
+          a regular expression that `swift test` compares against
+          `<test-target>.<test-case>/<test>`, so the name of a test target,
+          or a prefix that several test targets share, selects those targets.
+          A run whose selectors match no test at all FAILS the job, because
+          `swift test` reports such a run as a clean exit 0 and a job that
+          measured nothing must not report green. Leave empty to run
+          `swift test` with no selectors, exactly as before.
+        required: false
+        type: string
+        default: ""
+      test-skip:
+        description: >
+          Test-target selectors to pass to `swift test` as `--skip` in the
+          unit test job, in the same form as test-filter. Use this when the
+          slow, real-resource tests of the package live in an ordinary test
+          target that the unit job must hold out. Leave empty to skip
+          nothing.
+        required: false
+        type: string
+        default: ""
+      test-no-parallel:
+        description: >
+          Pass `--no-parallel` to `swift test` in the unit test job. Set this
+          for a test target that lets only one test hold a resource at a
+          time: Swift Testing starts the time limit of a test before the test
+          takes such a turnstile, so a parallel run spends the limit on queue
+          time and a queued suite fails in the same way as a hang.
+        required: false
+        type: boolean
+        default: false
       integration-gate-env:
         description: >
+          LEGACY, kept for the repositories that already pass it. Prefer
+          integration-filter and integration-skip, which select the gated
+          tests by TEST TARGET instead.
+
           Name of an env var to set to 1 to unlock a gated, opt-in
           integration suite that depends on real external resources (models,
           network, GPU). Leave empty to skip the integration job entirely.
           Runs on every trigger (push, pull_request, workflow_dispatch) once
-          set, same as the unit test job.
+          set, same as the unit test job. Cannot be combined with
+          integration-filter or integration-skip; the job stops if both are
+          given.
         required: false
         type: string
         default: ""
@@ -26,6 +66,14 @@ on:
           find(1) -path glob, relative to .build, locating the integration
           suite's .xctest bundle (e.g. '*IntegrationTests.xctest'). Required
           when integration-gate-env is set.
+
+          LIMITATION: exactly ONE bundle runs. The glob is read with
+          `head -n 1`, so when it matches more than one .xctest bundle, only
+          the first one runs and the rest never execute and never report.
+          A package whose gated tests live in more than one bundle therefore
+          has bundles that CI has never run. integration-filter does not have
+          this limitation, because `swift test` runs every bundle its
+          selectors match.
         required: false
         type: string
         default: ""
@@ -35,10 +83,46 @@ on:
           mlx-swift default.metallib to copy next to the xctest bundle
           before running it (e.g. '*Cmlx*/default.metallib'). Works around
           `swift test`/xctest failing to load it under SwiftPM. Leave empty
-          if the integration suite doesn't depend on mlx-swift.
+          if the integration suite doesn't depend on mlx-swift. Only used by
+          the legacy integration-gate-env path: the integration-filter path
+          runs the tests through `swift test`, which needs no such copy.
         required: false
         type: string
         default: ""
+      integration-filter:
+        description: >
+          Test-target selectors to pass to `swift test` as `--filter` in the
+          integration job, in the same form as test-filter. This is the way
+          to select the gated tests BY TEST TARGET, and it replaces
+          integration-gate-env, integration-xctest-glob and
+          integration-metallib-glob.
+
+          Setting this, or integration-skip, runs the integration job. A run
+          whose selectors match no test at all FAILS the job. Unlike
+          integration-xctest-glob, every test target the selectors match
+          runs, not only the first one.
+        required: false
+        type: string
+        default: ""
+      integration-skip:
+        description: >
+          Test-target selectors to pass to `swift test` as `--skip` in the
+          integration job, in the same form as test-filter. Use this to hold
+          out a tier that is too slow even for the integration job. Setting
+          this, or integration-filter, runs the integration job.
+        required: false
+        type: string
+        default: ""
+      integration-no-parallel:
+        description: >
+          Pass `--no-parallel` to `swift test` in the integration job. Set
+          this for a test target that lets only one test hold a real
+          resource, such as a GPU model, at a time. See test-no-parallel for
+          why a parallel run of such a target fails in the same way as a
+          hang.
+        required: false
+        type: boolean
+        default: false
       example-targets:
         description: >
           Whitespace-separated list of additional executable target names to
@@ -98,8 +182,19 @@ jobs:
       - name: Build (incl. tests)
         run: swift build --build-tests
 
+      # Two steps, and exactly one of them runs. A caller that passes none of
+      # the test-* selectors gets the plain `swift test` it has always got.
       - name: Run tests
+        if: inputs.test-filter == '' && inputs.test-skip == '' && !inputs.test-no-parallel
         run: swift test
+
+      - name: Run the selected tests
+        if: inputs.test-filter != '' || inputs.test-skip != '' || inputs.test-no-parallel
+        uses: swissarmyhammer/workflows/.github/actions/swift-test@main
+        with:
+          filter: ${{ inputs.test-filter }}
+          skip: ${{ inputs.test-skip }}
+          no-parallel: ${{ inputs.test-no-parallel }}
 
       - name: Build additional example targets
         if: inputs.example-targets != ''
@@ -126,10 +221,27 @@ jobs:
 
   integration:
     name: Integration (opt-in, real dependencies)
-    if: inputs.integration-gate-env != ''
+    # A fast unit failure must stop the run before this job takes the runner.
+    needs: test
+    # Either the legacy env-var gate, or the test-target selectors, runs this
+    # job.
+    if: >-
+      inputs.integration-gate-env != ''
+      || inputs.integration-filter != ''
+      || inputs.integration-skip != ''
     runs-on: [self-hosted, macOS]
     steps:
       - uses: actions/checkout@v4
+
+      # The two paths select different tests, so a caller that gives both
+      # gets one of the two silently ignored. Stop instead.
+      - name: Reject both integration paths at once
+        if: >-
+          inputs.integration-gate-env != ''
+          && (inputs.integration-filter != '' || inputs.integration-skip != '')
+        run: |
+          echo "::error::integration-gate-env cannot be combined with integration-filter or integration-skip. Use the selectors alone."
+          exit 1
 
       - name: Configure DEVELOPER_DIR
         if: inputs.developer-dir != ''
@@ -141,7 +253,16 @@ jobs:
       - name: Build tests
         run: swift build --build-tests
 
+      - name: Run the selected integration tests
+        if: inputs.integration-gate-env == ''
+        uses: swissarmyhammer/workflows/.github/actions/swift-test@main
+        with:
+          filter: ${{ inputs.integration-filter }}
+          skip: ${{ inputs.integration-skip }}
+          no-parallel: ${{ inputs.integration-no-parallel }}
+
       - name: Run gated integration suite
+        if: inputs.integration-gate-env != ''
         run: |
           set -euo pipefail
           XCTEST="$(find .build -path '${{ inputs.integration-xctest-glob }}' -type d | head -n 1)"

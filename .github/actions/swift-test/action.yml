@@ -1,0 +1,78 @@
+name: Swift test
+description: >
+  Runs `swift test` with the given test-target selectors, and fails the step
+  when the selectors matched no test at all.
+
+  Use this action directly from a repository that writes its own CI steps.
+  The `swift-ci.yaml` reusable workflow in this repository calls the same
+  action, so both routes behave identically.
+
+inputs:
+  filter:
+    description: >
+      Test-target selectors to pass as `--filter`, separated by spaces or by
+      newlines. Each selector is a regular expression that `swift test`
+      compares against `<test-target>.<test-case>/<test>`, so the name of a
+      test target, or a prefix that the test targets share, selects those
+      targets. Leave empty to select every test.
+    required: false
+    default: ""
+  skip:
+    description: >
+      Test-target selectors to pass as `--skip`, separated by spaces or by
+      newlines. Same form as `filter`. Use this to hold the slow targets out
+      of a fast job. Leave empty to skip nothing.
+    required: false
+    default: ""
+  no-parallel:
+    description: >
+      Set to `true` to pass `--no-parallel`. Necessary for a test target that
+      lets only one test hold a resource at a time: Swift Testing starts the
+      time limit of a test before the test takes such a turnstile, so a
+      parallel run spends the limit on queue time and a queued suite fails in
+      the same way as a hang.
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Run the selected tests
+      shell: bash
+      env:
+        SWIFT_TEST_FILTER: ${{ inputs.filter }}
+        SWIFT_TEST_SKIP: ${{ inputs.skip }}
+        SWIFT_TEST_NO_PARALLEL: ${{ inputs.no-parallel }}
+      run: |
+        set -euo pipefail
+
+        # Build the option list. `set -f` stops the shell from expanding a
+        # selector such as `*Tests` against the files in the directory, and
+        # lets the loop split the input on spaces, tabs and newlines.
+        set -f
+        args=()
+        for pattern in ${SWIFT_TEST_FILTER:-}; do args+=(--filter "$pattern"); done
+        for pattern in ${SWIFT_TEST_SKIP:-}; do args+=(--skip "$pattern"); done
+        set +f
+        if [ "${SWIFT_TEST_NO_PARALLEL:-false}" = "true" ]; then args+=(--no-parallel); fi
+
+        # `${args[@]+...}` keeps bash 3.2, which is the bash on a macOS
+        # runner, from calling an empty array unbound under `set -u`.
+        set -- ${args[@]+"${args[@]}"}
+        echo "::group::swift test $*"
+
+        log="$(mktemp)"
+        trap 'rm -f "$log"' EXIT
+
+        # `pipefail` above is what carries a failure of `swift test` through
+        # `tee`.
+        swift test "$@" 2>&1 | tee "$log"
+        echo "::endgroup::"
+
+        # `swift test` answers 0 when the selectors match no test at all: it
+        # prints this warning on standard error and exits clean. A job that
+        # measured nothing must fail, so the warning becomes a failure here.
+        if grep -q 'No matching test cases were run' "$log"; then
+          echo "::error::swift test $* matched no test case: this run measured nothing"
+          exit 1
+        fi
