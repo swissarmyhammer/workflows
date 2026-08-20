@@ -140,6 +140,19 @@ on:
         required: false
         type: string
         default: ""
+      integration-artifacts-path:
+        description: >
+          Path, relative to the repository root, to the forensic output of the
+          integration suite, such as the transcripts that the tests write (e.g.
+          'IntegrationTests/.build/recordings'). The integration job uploads
+          this path as an artifact named integration-artifacts after the tests
+          run, and it uploads the path also when the test step fails, stops on
+          a time limit, or is cancelled. A run that hangs with no output thus
+          keeps the files that show what happened. A run that writes no file
+          uploads nothing and stays green. Leave empty to upload nothing.
+        required: false
+        type: string
+        default: ""
       example-targets:
         description: >
           Whitespace-separated list of additional executable target names to
@@ -340,3 +353,17 @@ jobs:
           fi
 
           ${{ inputs.integration-gate-env }}=1 xcrun xctest "$XCTEST"
+
+      # The forensic files of a run are most necessary when the run went wrong,
+      # so `always()` keeps this step after a test step that failed, stopped on
+      # a time limit, or was cancelled. A run that hangs for 30 minutes with no
+      # model output leaves a transcript that a person can read. The step runs
+      # after both test steps above, because exactly one of the two ran.
+      - name: Upload the integration artifacts
+        if: always() && inputs.integration-artifacts-path != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-artifacts
+          path: ${{ inputs.integration-artifacts-path }}
+          # A run that wrote no file must not fail the job for that.
+          if-no-files-found: ignore

@@ -102,6 +102,26 @@ The `swift-test` action reads that warning and fails the step. Both jobs of
 `swift-ci.yaml` use the action, so a selector that names a target which was
 renamed away fails the job.
 
+## Keep the forensic files of the integration job
+
+Set `integration-artifacts-path` to the directory that the integration suite
+writes its transcripts, logs or recordings to. The integration job then uploads
+that path as an artifact with the name `integration-artifacts`.
+
+The upload runs after the tests in all conditions: after a clean run, after a
+failure, after a time limit, and after a cancellation. Thus a run that hangs
+for 30 minutes with no output still keeps the files that show what happened.
+A run that writes no file uploads nothing, and the job stays green.
+
+```yaml
+jobs:
+  ci:
+    uses: swissarmyhammer/workflows/.github/workflows/swift-ci.yaml@main
+    with:
+      integration-package-path: IntegrationTests
+      integration-artifacts-path: IntegrationTests/.build/recordings
+```
+
 ## Inputs of `swift-ci.yaml`
 
 All inputs are optional. A caller that gives no input builds the package and
@@ -118,6 +138,7 @@ runs `swift test` with no selectors.
 | `integration-no-parallel` | boolean | `false` | Give `--no-parallel` to the integration job. |
 | `integration-package-path` | string | `""` | Path to a nested integration package. Setting this runs the integration job. |
 | `integration-metallib-glob` | string | `""` | `find(1)` glob that finds a `default.metallib` to copy next to the `.xctest` bundles. |
+| `integration-artifacts-path` | string | `""` | Path that the integration job uploads as an artifact after the tests. Setting this keeps the forensic files of a failed run. |
 | `example-targets` | string | `""` | Names of more executable targets to build one by one. |
 | `docc-target` | string | `""` | Name of a library target to build a DocC catalog for. |
 | `docc-coverage-script` | string | `""` | Script that fails on a DocC coverage gap. |
