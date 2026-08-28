@@ -94,6 +94,30 @@ run.
 A repository that writes its own CI steps instead of calling `swift-ci.yaml`
 must obey the same two requirements itself.
 
+### A suite that starts an executable of the root package
+
+The integration job removes the root `.build` at its start, and the nested
+package build writes its products under `IntegrationTests/.build`. Thus no
+product of the root package stands at `.build/debug` in that job. A test that
+starts such a product as a subprocess, and reads it at
+`.build/debug/<name>`, does not find it.
+
+Set `integration-root-products` to the names of those products. The job then
+runs `swift build --product <name>` at the repository root, for each name,
+before the tests run.
+
+```yaml
+jobs:
+  ci:
+    uses: swissarmyhammer/workflows/.github/workflows/swift-ci.yaml@main
+    with:
+      integration-package-path: IntegrationTests
+      integration-root-products: mcp-test-server
+```
+
+The unit job needs no such input. Its `swift build --build-tests` at the root
+builds every product of the root manifest.
+
 ## `swift test` exits 0 when it matches nothing
 
 `swift test` writes `warning: No matching test cases were run` and exits 0 when
@@ -138,6 +162,7 @@ runs `swift test` with no selectors.
 | `integration-no-parallel` | boolean | `false` | Give `--no-parallel` to the integration job. |
 | `integration-package-path` | string | `""` | Path to a nested integration package. Setting this runs the integration job. |
 | `integration-metallib-glob` | string | `""` | `find(1)` glob that finds a `default.metallib` to copy next to the `.xctest` bundles. |
+| `integration-root-products` | string | `""` | Names of products of the ROOT package that the integration job builds at the repository root, before the tests run. Set this for a suite that starts one of them as a subprocess. |
 | `integration-artifacts-path` | string | `""` | Path that the integration job uploads as an artifact after the tests. Setting this keeps the forensic files of a failed run. |
 | `example-targets` | string | `""` | Names of more executable targets to build one by one. |
 | `docc-target` | string | `""` | Name of a library target to build a DocC catalog for. |

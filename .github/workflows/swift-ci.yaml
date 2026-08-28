@@ -140,6 +140,22 @@ on:
         required: false
         type: string
         default: ""
+      integration-root-products:
+        description: >
+          Whitespace-separated list of product names of the ROOT package to
+          build at the repository root before the integration tests run (e.g.
+          'mcp-test-server'). Set this for a suite that starts an executable of
+          the root package as a subprocess and reads it at
+          `.build/debug/<name>`.
+
+          The integration job removes the root .build at its start, and a
+          nested package build writes its products under
+          <integration-package-path>/.build. Thus no other step of that job
+          puts a root product at .build/debug, and a suite that expects one
+          fails. Leave empty to build no root product.
+        required: false
+        type: string
+        default: ""
       integration-artifacts-path:
         description: >
           Path, relative to the repository root, to the forensic output of the
@@ -303,6 +319,20 @@ jobs:
         run: |
           rm -rf '${{ inputs.integration-package-path }}/.build'
           swift build --package-path '${{ inputs.integration-package-path }}' --build-tests
+
+      # The clean step above removed the root .build, and the nested package
+      # build writes its products under the nested .build. Thus a product of
+      # the root package stands nowhere in this job. Build each product that
+      # the integration suite starts as a subprocess.
+      - name: Build the root products the integration suite starts
+        if: inputs.integration-root-products != ''
+        run: |
+          set -euo pipefail
+          for product in ${{ inputs.integration-root-products }}; do
+            echo "::group::swift build --product $product"
+            swift build --product "$product"
+            echo "::endgroup::"
+          done
 
       # mlx-swift's default.metallib does not load from the SwiftPM build
       # layout on its own. Copy it next to each .xctest bundle of the nested
