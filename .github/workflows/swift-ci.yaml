@@ -211,7 +211,7 @@ jobs:
     name: Build & test
     runs-on: [self-hosted, macOS]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Configure DEVELOPER_DIR
         if: inputs.developer-dir != ''
@@ -287,7 +287,7 @@ jobs:
       || inputs.integration-package-path != ''
     runs-on: [self-hosted, macOS]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # The two paths select different tests, so a caller that gives both
       # gets one of the two silently ignored. Stop instead.
