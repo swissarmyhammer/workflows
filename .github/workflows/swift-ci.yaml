@@ -45,6 +45,26 @@ on:
         required: false
         type: boolean
         default: false
+      test-timeout-minutes:
+        description: >
+          Time limit, in minutes, of the plain `swift test` step of the unit
+          job. A hung run then fails at this limit in place of holding the
+          runner. Defaults to GitHub's own limit of a step, so a caller that
+          does not set it sees no change. It does not apply when a test-*
+          selector is set.
+        required: false
+        type: number
+        default: 360
+      test-sample-after-minutes:
+        description: >
+          When above 0, a plain `swift test` step still running after this many
+          minutes records a `sample` of each test process, and the job uploads
+          them as the artifact test-hang-samples. Set it below
+          test-timeout-minutes so a hang leaves a stack. Defaults to 0, which
+          samples nothing.
+        required: false
+        type: number
+        default: 0
       integration-gate-env:
         description: >
           LEGACY, kept for the repositories that already pass it. Prefer
@@ -232,7 +252,33 @@ jobs:
       # the test-* selectors gets the plain `swift test` it has always got.
       - name: Run tests
         if: inputs.test-filter == '' && inputs.test-skip == '' && !inputs.test-no-parallel
-        run: swift test
+        timeout-minutes: ${{ inputs.test-timeout-minutes }}
+        run: |
+          # With test-sample-after-minutes set, a run still going at that point
+          # records the stacks of its test processes, so a hang leaves evidence
+          # for the next step to upload.
+          sample_after='${{ inputs.test-sample-after-minutes }}'
+          if [ "$sample_after" -gt 0 ]; then
+            (
+              sleep $((sample_after * 60))
+              mkdir -p "$RUNNER_TEMP/test-hang-samples"
+              for pid in $(pgrep -U "$(id -u)" -f 'swiftpm-testing-helper|xctest'); do
+                sample "$pid" 5 -file "$RUNNER_TEMP/test-hang-samples/$pid.txt" || true
+              done
+            ) &
+            sampler=$!
+            trap 'kill "$sampler" 2>/dev/null || true' EXIT
+          fi
+          swift test
+
+      - name: Upload the hang samples
+        if: always() && inputs.test-sample-after-minutes > 0
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-hang-samples
+          path: ${{ runner.temp }}/test-hang-samples
+          # A run that finished in time wrote no sample.
+          if-no-files-found: ignore
 
       - name: Run the selected tests
         if: inputs.test-filter != '' || inputs.test-skip != '' || inputs.test-no-parallel
