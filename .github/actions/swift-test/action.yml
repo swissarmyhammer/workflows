@@ -76,9 +76,11 @@ runs:
         log="$(mktemp)"
         trap 'rm -f "$log"' EXIT
 
-        # `pipefail` above is what carries a failure of `swift test` through
-        # `tee`.
-        swift test "$@" 2>&1 | tee "$log"
+        # `script` gives `swift test` a terminal, so it writes each line at
+        # once and not in blocks, and `script` puts standard error in the same
+        # stream. `script` ends with the status of the command, and `pipefail`
+        # above carries that status through `tee`.
+        script -q /dev/null swift test "$@" | tee "$log"
         echo "::endgroup::"
 
         # `swift test` answers 0 when the selectors match no test at all: it

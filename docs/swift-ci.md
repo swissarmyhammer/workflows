@@ -146,6 +146,144 @@ jobs:
       integration-artifacts-path: IntegrationTests/.build/recordings
 ```
 
+## Keep the build between runs
+
+By default each job removes `.build` and builds everything: the unit job and
+the integration job each compile the root package and the nested package. On a
+self-hosted runner this is the largest part of the run time. Set
+`persistent-build: true` to keep the build between runs, so a normal push
+builds only what changed. The default is `false`, and then nothing about the
+build directories changes.
+
+```yaml
+jobs:
+  ci:
+    uses: swissarmyhammer/workflows/.github/workflows/swift-ci.yaml@main
+    with:
+      integration-package-path: IntegrationTests
+      persistent-build: true
+```
+
+### Where the build lives
+
+The build of the root package and the build of the nested package live in one
+directory for each repository and each branch:
+
+```text
+<build-cache-dir>/<owner>/<repo>/<branch-slug>-<hash>/
+  root/      the build of the root package
+  nested/    the build of the nested package
+  lock/      exists while a job uses the directory
+  fingerprint, created, used
+```
+
+`build-cache-dir` is `swift-ci-build` in the tool cache of the runner
+(`RUNNER_TOOL_CACHE`) unless you set it. A pull request uses the name of its
+head branch, so a push and a pull request of one branch share the directory.
+The hash keeps the branches `feat/a` and `feat-a` apart.
+
+The workspace `.build` of the root package, and `<integration-package-path>/.build`
+of the nested package, become symbolic links to `root/` and `nested/`. The
+workflow does not pass `--scratch-path`. A link keeps every other path right,
+because the steps and the tests keep their usual `.build` paths:
+
+- the metallib step and the legacy gated step search the build with
+  `find -H`, which follows the link;
+- `BuiltProductLocator` and other code that reads `--test-bundle-path` derives
+  the products directory from the bundle path, and it needs no `.build` name;
+- the DocC steps and `integration-artifacts-path` find `.build` where they
+  always did;
+- the nested package, which depends on the root package by `..`, builds in
+  `nested/`, as it builds in its own `.build` today.
+
+The unit job and the integration job of one run use the same two directories.
+The integration job thus rebuilds nothing that the unit job built, as long as
+both jobs run on the same runner. With more than one runner in the pool, a job
+on a runner with no saved build builds everything, which is correct and slower.
+The tool cache belongs to one runner, so each runner keeps its own builds.
+
+### The lock
+
+Two runs of one repository must not use one directory at the same time. A job
+takes the lock of its directory in its first step and releases it in its last
+step. The release step runs also after a failure and after a cancellation.
+
+The lock is a directory that `mkdir` makes, and `mkdir` is atomic. A job that
+finds the lock held polls every 10 seconds, prints who holds it every minute,
+and fails with an error when `build-lock-timeout-minutes` ends. The lock names
+its owner: the runner process of the holding job. A lock whose owner process is
+gone, for example after a crash of the runner, is stale. The next job removes a
+stale lock and takes it.
+
+The workflow does not use `concurrency` for this, for three reasons:
+
+- A `concurrency` group keeps only one waiting run, and it cancels the others.
+  A run that waits for a build directory must wait, not die.
+- A `concurrency` group of the called workflow can deadlock with a group of the
+  same name in the caller. The caller of this workflow often sets a group such
+  as `ci-${{ github.ref }}` already.
+- A push and a pull request of one branch have different `github.ref` values,
+  and they use one directory. The lock sees the directory, and a group sees
+  only its name.
+
+### When the build is cleaned
+
+The job cleans the persistent build, and builds everything, when one of these
+is true:
+
+- `clean-build` is `true`;
+- the fingerprint changed since the last run. The fingerprint holds the output
+  of `swift --version`, the SDK version, `DEVELOPER_DIR`, and the hash of each
+  `Package.swift` file and each `Package.resolved` file that git tracks;
+- the directory is older than `build-max-age-days` (7 days). A busy branch thus
+  starts from nothing once a week.
+
+The job also removes a directory of the same repository that no run used for
+`build-max-age-days`, if no job holds its lock. A deleted branch thus does not
+keep its build for ever.
+
+### Floating dependencies and `swift package update`
+
+The workflow does NOT run `swift package update`, for these reasons:
+
+- With a tracked `Package.resolved`, the pin is the decision of the repository.
+  `swift package update` would replace it with the newest revision, and the run
+  would build something that nobody committed. A change of the pin changes the
+  fingerprint, and the build is cleaned.
+- Without a tracked `Package.resolved`, the checkout of each run removes the
+  untracked `Package.resolved` file, so SwiftPM resolves with no pin. It then
+  fetches the floating branch, and it moves a dependency whose branch has a new
+  commit. SwiftPM rebuilds only the modules that depend on the changed
+  checkout.
+
+A repository that wants a new revision of a pinned dependency commits the new
+`Package.resolved`, as before.
+
+## Time limits, the log and the dependency report
+
+Every step that resolves, builds, or generates documentation has
+`timeout-minutes: build-timeout-minutes` (60). The step that runs the
+integration tests has `integration-timeout-minutes` (60). A hung step then fails
+at its limit. The plain `swift test` step keeps `test-timeout-minutes`. Raise a
+limit for a repository whose clean build or whose integration suite takes
+longer.
+
+The `swift test` steps run under `script -q /dev/null`. `script` gives the
+command a terminal, so the command writes each line at once and the job log
+shows the progress while the tests run. `script` ends with the exit status of
+the command, so a failed test still fails the step. The first line of the log
+can start with `^D` and two backspace characters, which `script` writes when
+standard input is not a terminal.
+
+Before each build, a step reports the SwiftPM cache of the runner
+(`~/Library/Caches/org.swift.swiftpm`): its size, the number of repository
+clones, the age of the newest and the oldest entry, and each
+`maintenance.lock` older than 60 minutes. The step then runs
+`swift package resolve` for the root package, and for the nested package, and
+it prints the time of each resolve. A slow run thus shows how much of its time
+went to dependency clones. The step only reads the cache. It never removes a
+cache.
+
 ## Inputs of `swift-ci.yaml`
 
 All inputs are optional. A caller that gives no input builds the package and
@@ -169,6 +307,15 @@ runs `swift test` with no selectors.
 | `docc-coverage-script` | string | `""` | Script that fails on a DocC coverage gap. |
 | `integration-gate-env` | string | `""` | LEGACY. Name of an environment variable that unlocks a gated suite. |
 | `integration-xctest-glob` | string | `""` | LEGACY. `find(1)` glob that finds the `.xctest` bundle. |
+| `persistent-build` | boolean | `false` | Keep the build between runs on the same runner. See "Keep the build between runs". |
+| `clean-build` | boolean | `false` | Only with `persistent-build`. Clean the persistent build at the start of this run. |
+| `build-cache-dir` | string | `""` | Only with `persistent-build`. Directory that holds the persistent builds. Empty means `swift-ci-build` in the tool cache of the runner. |
+| `build-lock-timeout-minutes` | number | `120` | Only with `persistent-build`. How long a job waits for the lock of its build directory. |
+| `build-max-age-days` | number | `7` | Only with `persistent-build`. Age at which a build directory is cleaned. |
+| `build-timeout-minutes` | number | `60` | Time limit of each step that resolves, builds, or generates documentation. |
+| `integration-timeout-minutes` | number | `60` | Time limit of the step that runs the integration tests. |
+| `test-timeout-minutes` | number | `360` | Time limit of the plain `swift test` step of the unit job. |
+| `test-sample-after-minutes` | number | `0` | When above 0, a plain `swift test` step that is still running after this time records stack samples. |
 
 Set `test-no-parallel` or `integration-no-parallel` for a test target that lets
 only one test hold a resource at a time. Swift Testing starts the time limit of

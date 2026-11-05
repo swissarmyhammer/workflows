@@ -225,6 +225,69 @@ on:
         required: false
         type: string
         default: ""
+      persistent-build:
+        description: >
+          Keep the build between runs on the same runner, so a normal push
+          builds only what changed. The root build and the nested package
+          build live in one directory for each repository and each branch,
+          under build-cache-dir. Each `.build` of the workspace becomes a
+          symbolic link to that directory, so every later step keeps its usual
+          paths. The unit job and the integration job of a run use the same
+          directories. A lock keeps two runs of one branch from using a
+          directory at the same time. The directory is cleaned when the
+          toolchain, a Package.swift file, or a tracked Package.resolved file
+          changed since the last run, when it is older than
+          build-max-age-days, and when clean-build is true. Leave false to
+          remove `.build` and build everything on each run, exactly as before.
+        required: false
+        type: boolean
+        default: false
+      clean-build:
+        description: >
+          Only with persistent-build. Clean the persistent build directory at
+          the start of this run, and build everything. Use this when a saved
+          build is broken.
+        required: false
+        type: boolean
+        default: false
+      build-cache-dir:
+        description: >
+          Only with persistent-build. Directory that holds the persistent
+          builds. Leave empty to use `swift-ci-build` in the tool cache of the
+          runner, which keeps each runner on its own builds.
+        required: false
+        type: string
+        default: ""
+      build-lock-timeout-minutes:
+        description: >
+          Only with persistent-build. How long a job waits for the lock of its
+          build directory, while a job of an other run holds it. The job fails
+          when the time ends.
+        required: false
+        type: number
+        default: 120
+      build-max-age-days:
+        description: >
+          Only with persistent-build. A build directory older than this number
+          of days is cleaned at the start of a run. A build directory of the
+          same repository that no run used for this number of days is removed.
+        required: false
+        type: number
+        default: 7
+      build-timeout-minutes:
+        description: >
+          Time limit, in minutes, of each step that resolves, builds, or
+          generates documentation. A hung step then fails at this limit in
+          place of holding the runner.
+        required: false
+        type: number
+        default: 60
+      integration-timeout-minutes:
+        description: >
+          Time limit, in minutes, of the step that runs the integration tests.
+        required: false
+        type: number
+        default: 60
 
 jobs:
   test:
@@ -242,10 +305,199 @@ jobs:
           sw_vers
           swift --version
 
+      # GitHub Actions has no way to share a step between two jobs, so the next
+      # three steps stand in both jobs, and the release step at the end of each
+      # job too. Keep each pair byte-identical.
+      #
+      # The attach step has no timeout-minutes of its own: its script fails
+      # the job at build-lock-timeout-minutes.
+      - name: Attach the persistent build
+        if: inputs.persistent-build
+        env:
+          PB_CLEAN: ${{ inputs.clean-build }}
+          PB_NESTED: ${{ inputs.integration-package-path }}
+          PB_CACHE_BASE: ${{ inputs.build-cache-dir }}
+          PB_REPOSITORY: ${{ github.repository }}
+          PB_BRANCH: ${{ github.head_ref || github.ref_name }}
+          PB_LOCK_TIMEOUT_MINUTES: ${{ inputs.build-lock-timeout-minutes }}
+          PB_MAX_AGE_DAYS: ${{ inputs.build-max-age-days }}
+        run: |
+          set -euo pipefail
+
+          # Where the build lives: one directory for each repository and each branch.
+          # The slug is readable, and the hash keeps two branch names that differ only in
+          # punctuation (feat/a and feat-a) in two directories.
+          base="${PB_CACHE_BASE:-${RUNNER_TOOL_CACHE:-$HOME/ci-build-cache}/swift-ci-build}"
+          slug="$(printf '%s' "$PB_BRANCH" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9._-' '-' | cut -c1-48)"
+          hash="$(printf '%s' "$PB_BRANCH" | shasum -a 256 | cut -c1-8)"
+          repo_dir="$base/$PB_REPOSITORY"
+          dir="$repo_dir/$slug-$hash"
+          lock="$dir/lock"
+          max_age_minutes=$((PB_MAX_AGE_DAYS * 1440))
+          poll_seconds="${PB_LOCK_POLL_SECONDS:-10}"
+
+          # The owner of the lock is the runner process of this job, which stays alive
+          # for all the steps of the job. A lock whose owner process is gone is stale.
+          process_start() { ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' || true; }
+          my_owner="$PPID|$(process_start "$PPID")|$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB"
+
+          lock_is_stale() {
+            local pid start
+            if [ ! -f "$lock/owner" ]; then
+              # The owner is between `mkdir` and the write of its name.
+              [ -n "$(find "$lock" -maxdepth 0 -mmin +2)" ]
+              return
+            fi
+            IFS='|' read -r pid start _ < "$lock/owner"
+            if [ -z "$start" ]; then
+              if kill -0 "$pid" 2>/dev/null; then return 1; else return 0; fi
+            fi
+            [ "$(process_start "$pid")" != "$start" ]
+          }
+
+          # `mkdir` is atomic, so exactly one job holds the lock. A waiter polls until
+          # the holder releases it, and fails the job at the time limit.
+          acquire_lock() {
+            local waited=0 limit=$((PB_LOCK_TIMEOUT_MINUTES * 60))
+            until mkdir "$lock" 2>/dev/null; do
+              if lock_is_stale; then
+                echo "Remove a stale lock of: $(cat "$lock/owner" 2>/dev/null || echo unknown)"
+                mv "$lock" "$lock.stale.$$" 2>/dev/null && rm -rf "$lock.stale.$$"
+                continue
+              fi
+              if [ "$waited" -ge "$limit" ]; then
+                echo "::error::The build directory $dir stayed locked for ${PB_LOCK_TIMEOUT_MINUTES} minutes by: $(cat "$lock/owner" 2>/dev/null || echo unknown)"
+                return 1
+              fi
+              if [ $((waited % 60)) -eq 0 ]; then
+                echo "Wait for the lock of $dir, held by: $(cat "$lock/owner" 2>/dev/null || echo unknown)"
+              fi
+              sleep "$poll_seconds"
+              waited=$((waited + poll_seconds))
+            done
+            echo "$my_owner" > "$lock/owner"
+          }
+
+          # A build directory of a branch that nobody used for a long time is dead
+          # weight. Remove it, unless a job holds its lock.
+          prune_idle_builds() {
+            local other
+            find "$repo_dir" -mindepth 1 -maxdepth 1 -type d ! -path "$dir" | while IFS= read -r other; do
+              if [ ! -d "$other/lock" ] && [ -f "$other/used" ] \
+                && [ -n "$(find "$other/used" -mmin +"$max_age_minutes")" ]; then
+                echo "Remove the idle build directory $other"
+                rm -rf "$other"
+              fi
+            done
+          }
+
+          # A change of any of these makes the saved build wrong or useless: the
+          # compiler, the SDK, and every manifest or pin file that git tracks.
+          fingerprint() {
+            {
+              swift --version 2>&1
+              echo "DEVELOPER_DIR=${DEVELOPER_DIR:-}"
+              xcrun --sdk macosx --show-sdk-version 2>/dev/null || true
+              cd "$GITHUB_WORKSPACE"
+              git ls-files | { grep -E '(^|/)Package\.(swift|resolved)$' || true; } | sort | while IFS= read -r file; do
+                printf '%s ' "$file"
+                shasum -a 256 < "$file"
+              done
+            } | shasum -a 256 | cut -d' ' -f1
+          }
+
+          # Point `<where>/.build` at a directory of the persistent build. A symbolic
+          # link keeps every later step on its usual path.
+          link_build() {
+            local target="$1" where="$2"
+            mkdir -p "$target" "$where"
+            rm -rf "$where/.build"
+            ln -s "$target" "$where/.build"
+            echo "  $where/.build -> $target"
+          }
+
+          mkdir -p "$dir"
+          echo "PB_DIR=$dir" >> "$GITHUB_ENV"
+          acquire_lock
+          prune_idle_builds
+
+          current="$(fingerprint)"
+          reason=""
+          if [ "$PB_CLEAN" = "true" ]; then
+            reason="the clean-build input is true"
+          elif [ ! -f "$dir/fingerprint" ]; then
+            echo "No earlier build in $dir: this run builds everything."
+          elif [ "$(cat "$dir/fingerprint")" != "$current" ]; then
+            reason="the toolchain or a Package.swift or Package.resolved file changed since the last run"
+          elif [ -n "$(find "$dir/created" -mmin +"$max_age_minutes" 2>/dev/null)" ]; then
+            reason="the build directory is older than $PB_MAX_AGE_DAYS days"
+          fi
+          if [ -n "$reason" ]; then
+            echo "Clean the persistent build, because $reason."
+            rm -rf "$dir/root" "$dir/nested" "$dir/created"
+          fi
+          mkdir -p "$dir/root" "$dir/nested"
+          echo "$current" > "$dir/fingerprint"
+          [ -f "$dir/created" ] || touch "$dir/created"
+          touch "$dir/used"
+
+          echo "Persistent build directory: $dir"
+          link_build "$dir/root" "$GITHUB_WORKSPACE"
+          if [ -n "$PB_NESTED" ]; then
+            link_build "$dir/nested" "$GITHUB_WORKSPACE/$PB_NESTED"
+          fi
+          du -sk "$dir/root" "$dir/nested" | awk '{ printf "  size: %d MB  %s\n", $1 / 1024, $2 }'
+
       - name: Clean build directory
+        if: ${{ !inputs.persistent-build }}
         run: rm -rf .build
 
+      - name: Report the SwiftPM cache and resolve the packages
+        timeout-minutes: ${{ inputs.build-timeout-minutes }}
+        env:
+          PB_NESTED: ${{ inputs.integration-package-path }}
+        run: |
+          set -euo pipefail
+
+          # Show what the dependency clones can cost, before the build starts, so a slow
+          # run shows its cause. The report only reads: it never removes a cache.
+          cache="$HOME/Library/Caches/org.swift.swiftpm"
+          if [ -d "$cache" ]; then
+            echo "SwiftPM cache: $cache"
+            du -sk "$cache" | awk '{ printf "  size: %d MB\n", $1 / 1024 }'
+            echo "  repository clones: $(find "$cache/repositories" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' ')"
+            newest="$(find "$cache" -mindepth 1 -maxdepth 2 -exec stat -f '%m' {} + 2>/dev/null | sort -n | tail -n 1)"
+            oldest="$(find "$cache" -mindepth 1 -maxdepth 2 -exec stat -f '%m' {} + 2>/dev/null | sort -n | head -n 1)"
+            now="$(date +%s)"
+            if [ -n "$newest" ]; then
+              echo "  newest entry: $(( (now - newest) / 3600 )) hours old"
+              echo "  oldest entry: $(( (now - oldest) / 86400 )) days old"
+            fi
+            # A maintenance.lock that stays for a long time can make every clone slow.
+            find "$cache" -maxdepth 3 -name maintenance.lock -mmin +60 2>/dev/null | head -n 10 | while IFS= read -r lock_file; do
+              echo "::warning::SwiftPM cache lock older than 60 minutes: $lock_file"
+            done
+          else
+            echo "No SwiftPM cache at $cache: every dependency clones from its remote."
+          fi
+
+          # Resolve apart from the build, to time the clones. The build resolves the
+          # same packages, and finds them ready.
+          resolve_and_time() {
+            local label="$1" started finished
+            shift
+            started="$(date +%s)"
+            swift package "$@" resolve
+            finished="$(date +%s)"
+            echo "::notice title=Resolve time::resolve of $label took $((finished - started)) seconds"
+          }
+          resolve_and_time "the root package"
+          if [ -n "$PB_NESTED" ]; then
+            resolve_and_time "the nested package $PB_NESTED" --package-path "$PB_NESTED"
+          fi
+
       - name: Build (incl. tests)
+        timeout-minutes: ${{ inputs.build-timeout-minutes }}
         run: swift build --build-tests
 
       # Two steps, and exactly one of them runs. A caller that passes none of
@@ -269,7 +521,10 @@ jobs:
             sampler=$!
             trap 'kill "$sampler" 2>/dev/null || true' EXIT
           fi
-          swift test
+          # `script` gives `swift test` a terminal, so it writes each line at
+          # once and not in blocks. `script` ends with the status of
+          # the command, so a failed test still fails the step.
+          script -q /dev/null swift test
 
       - name: Upload the hang samples
         if: always() && inputs.test-sample-after-minutes > 0
@@ -291,14 +546,18 @@ jobs:
       # The root build does not compile a nested integration package, so a
       # broken integration test would stay unseen between runs. Build the
       # package on every run.
+      - name: Clean the nested build directory
+        if: inputs.integration-package-path != '' && !inputs.persistent-build
+        run: rm -rf '${{ inputs.integration-package-path }}/.build'
+
       - name: Build the nested integration package
         if: inputs.integration-package-path != ''
-        run: |
-          rm -rf '${{ inputs.integration-package-path }}/.build'
-          swift build --package-path '${{ inputs.integration-package-path }}' --build-tests
+        timeout-minutes: ${{ inputs.build-timeout-minutes }}
+        run: swift build --package-path '${{ inputs.integration-package-path }}' --build-tests
 
       - name: Build additional example targets
         if: inputs.example-targets != ''
+        timeout-minutes: ${{ inputs.build-timeout-minutes }}
         run: |
           set -euo pipefail
           for target in ${{ inputs.example-targets }}; do
@@ -309,10 +568,12 @@ jobs:
 
       - name: DocC build
         if: inputs.docc-target != ''
+        timeout-minutes: ${{ inputs.build-timeout-minutes }}
         run: swift package generate-documentation --target ${{ inputs.docc-target }} --warnings-as-errors
 
       - name: DocC documentation coverage
         if: inputs.docc-target != '' && inputs.docc-coverage-script != ''
+        timeout-minutes: ${{ inputs.build-timeout-minutes }}
         run: |
           set -euo pipefail
           swift package generate-documentation --target ${{ inputs.docc-target }} \
@@ -320,6 +581,25 @@ jobs:
             > docc-coverage.txt
           python3 ${{ inputs.docc-coverage-script }} docc-coverage.txt
 
+      - name: Release the persistent build
+        if: always() && inputs.persistent-build
+        run: |
+          set -euo pipefail
+
+          # Release the lock of this job, and only the lock of this job. A job that never
+          # took the lock leaves the lock of the other job alone.
+          dir="${PB_DIR:-}"
+          if [ -z "$dir" ] || [ ! -f "$dir/lock/owner" ]; then
+            echo "No lock to release."
+            exit 0
+          fi
+          holder="$(cut -d'|' -f3 "$dir/lock/owner")"
+          if [ "$holder" = "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB" ]; then
+            rm -rf "$dir/lock"
+            echo "Released the lock of $dir."
+          else
+            echo "The lock of $dir belongs to $holder: leave it."
+          fi
   integration:
     name: Integration (opt-in, real dependencies)
     # A fast unit failure must stop the run before this job takes the runner.
@@ -351,20 +631,212 @@ jobs:
         if: inputs.developer-dir != ''
         run: echo "DEVELOPER_DIR=${{ inputs.developer-dir }}" >> "$GITHUB_ENV"
 
+      # GitHub Actions has no way to share a step between two jobs, so the next
+      # three steps stand in both jobs, and the release step at the end of each
+      # job too. Keep each pair byte-identical.
+      #
+      # The attach step has no timeout-minutes of its own: its script fails
+      # the job at build-lock-timeout-minutes.
+      - name: Attach the persistent build
+        if: inputs.persistent-build
+        env:
+          PB_CLEAN: ${{ inputs.clean-build }}
+          PB_NESTED: ${{ inputs.integration-package-path }}
+          PB_CACHE_BASE: ${{ inputs.build-cache-dir }}
+          PB_REPOSITORY: ${{ github.repository }}
+          PB_BRANCH: ${{ github.head_ref || github.ref_name }}
+          PB_LOCK_TIMEOUT_MINUTES: ${{ inputs.build-lock-timeout-minutes }}
+          PB_MAX_AGE_DAYS: ${{ inputs.build-max-age-days }}
+        run: |
+          set -euo pipefail
+
+          # Where the build lives: one directory for each repository and each branch.
+          # The slug is readable, and the hash keeps two branch names that differ only in
+          # punctuation (feat/a and feat-a) in two directories.
+          base="${PB_CACHE_BASE:-${RUNNER_TOOL_CACHE:-$HOME/ci-build-cache}/swift-ci-build}"
+          slug="$(printf '%s' "$PB_BRANCH" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9._-' '-' | cut -c1-48)"
+          hash="$(printf '%s' "$PB_BRANCH" | shasum -a 256 | cut -c1-8)"
+          repo_dir="$base/$PB_REPOSITORY"
+          dir="$repo_dir/$slug-$hash"
+          lock="$dir/lock"
+          max_age_minutes=$((PB_MAX_AGE_DAYS * 1440))
+          poll_seconds="${PB_LOCK_POLL_SECONDS:-10}"
+
+          # The owner of the lock is the runner process of this job, which stays alive
+          # for all the steps of the job. A lock whose owner process is gone is stale.
+          process_start() { ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' || true; }
+          my_owner="$PPID|$(process_start "$PPID")|$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB"
+
+          lock_is_stale() {
+            local pid start
+            if [ ! -f "$lock/owner" ]; then
+              # The owner is between `mkdir` and the write of its name.
+              [ -n "$(find "$lock" -maxdepth 0 -mmin +2)" ]
+              return
+            fi
+            IFS='|' read -r pid start _ < "$lock/owner"
+            if [ -z "$start" ]; then
+              if kill -0 "$pid" 2>/dev/null; then return 1; else return 0; fi
+            fi
+            [ "$(process_start "$pid")" != "$start" ]
+          }
+
+          # `mkdir` is atomic, so exactly one job holds the lock. A waiter polls until
+          # the holder releases it, and fails the job at the time limit.
+          acquire_lock() {
+            local waited=0 limit=$((PB_LOCK_TIMEOUT_MINUTES * 60))
+            until mkdir "$lock" 2>/dev/null; do
+              if lock_is_stale; then
+                echo "Remove a stale lock of: $(cat "$lock/owner" 2>/dev/null || echo unknown)"
+                mv "$lock" "$lock.stale.$$" 2>/dev/null && rm -rf "$lock.stale.$$"
+                continue
+              fi
+              if [ "$waited" -ge "$limit" ]; then
+                echo "::error::The build directory $dir stayed locked for ${PB_LOCK_TIMEOUT_MINUTES} minutes by: $(cat "$lock/owner" 2>/dev/null || echo unknown)"
+                return 1
+              fi
+              if [ $((waited % 60)) -eq 0 ]; then
+                echo "Wait for the lock of $dir, held by: $(cat "$lock/owner" 2>/dev/null || echo unknown)"
+              fi
+              sleep "$poll_seconds"
+              waited=$((waited + poll_seconds))
+            done
+            echo "$my_owner" > "$lock/owner"
+          }
+
+          # A build directory of a branch that nobody used for a long time is dead
+          # weight. Remove it, unless a job holds its lock.
+          prune_idle_builds() {
+            local other
+            find "$repo_dir" -mindepth 1 -maxdepth 1 -type d ! -path "$dir" | while IFS= read -r other; do
+              if [ ! -d "$other/lock" ] && [ -f "$other/used" ] \
+                && [ -n "$(find "$other/used" -mmin +"$max_age_minutes")" ]; then
+                echo "Remove the idle build directory $other"
+                rm -rf "$other"
+              fi
+            done
+          }
+
+          # A change of any of these makes the saved build wrong or useless: the
+          # compiler, the SDK, and every manifest or pin file that git tracks.
+          fingerprint() {
+            {
+              swift --version 2>&1
+              echo "DEVELOPER_DIR=${DEVELOPER_DIR:-}"
+              xcrun --sdk macosx --show-sdk-version 2>/dev/null || true
+              cd "$GITHUB_WORKSPACE"
+              git ls-files | { grep -E '(^|/)Package\.(swift|resolved)$' || true; } | sort | while IFS= read -r file; do
+                printf '%s ' "$file"
+                shasum -a 256 < "$file"
+              done
+            } | shasum -a 256 | cut -d' ' -f1
+          }
+
+          # Point `<where>/.build` at a directory of the persistent build. A symbolic
+          # link keeps every later step on its usual path.
+          link_build() {
+            local target="$1" where="$2"
+            mkdir -p "$target" "$where"
+            rm -rf "$where/.build"
+            ln -s "$target" "$where/.build"
+            echo "  $where/.build -> $target"
+          }
+
+          mkdir -p "$dir"
+          echo "PB_DIR=$dir" >> "$GITHUB_ENV"
+          acquire_lock
+          prune_idle_builds
+
+          current="$(fingerprint)"
+          reason=""
+          if [ "$PB_CLEAN" = "true" ]; then
+            reason="the clean-build input is true"
+          elif [ ! -f "$dir/fingerprint" ]; then
+            echo "No earlier build in $dir: this run builds everything."
+          elif [ "$(cat "$dir/fingerprint")" != "$current" ]; then
+            reason="the toolchain or a Package.swift or Package.resolved file changed since the last run"
+          elif [ -n "$(find "$dir/created" -mmin +"$max_age_minutes" 2>/dev/null)" ]; then
+            reason="the build directory is older than $PB_MAX_AGE_DAYS days"
+          fi
+          if [ -n "$reason" ]; then
+            echo "Clean the persistent build, because $reason."
+            rm -rf "$dir/root" "$dir/nested" "$dir/created"
+          fi
+          mkdir -p "$dir/root" "$dir/nested"
+          echo "$current" > "$dir/fingerprint"
+          [ -f "$dir/created" ] || touch "$dir/created"
+          touch "$dir/used"
+
+          echo "Persistent build directory: $dir"
+          link_build "$dir/root" "$GITHUB_WORKSPACE"
+          if [ -n "$PB_NESTED" ]; then
+            link_build "$dir/nested" "$GITHUB_WORKSPACE/$PB_NESTED"
+          fi
+          du -sk "$dir/root" "$dir/nested" | awk '{ printf "  size: %d MB  %s\n", $1 / 1024, $2 }'
+
       - name: Clean build directory
+        if: ${{ !inputs.persistent-build }}
         run: rm -rf .build
+
+      - name: Report the SwiftPM cache and resolve the packages
+        timeout-minutes: ${{ inputs.build-timeout-minutes }}
+        env:
+          PB_NESTED: ${{ inputs.integration-package-path }}
+        run: |
+          set -euo pipefail
+
+          # Show what the dependency clones can cost, before the build starts, so a slow
+          # run shows its cause. The report only reads: it never removes a cache.
+          cache="$HOME/Library/Caches/org.swift.swiftpm"
+          if [ -d "$cache" ]; then
+            echo "SwiftPM cache: $cache"
+            du -sk "$cache" | awk '{ printf "  size: %d MB\n", $1 / 1024 }'
+            echo "  repository clones: $(find "$cache/repositories" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' ')"
+            newest="$(find "$cache" -mindepth 1 -maxdepth 2 -exec stat -f '%m' {} + 2>/dev/null | sort -n | tail -n 1)"
+            oldest="$(find "$cache" -mindepth 1 -maxdepth 2 -exec stat -f '%m' {} + 2>/dev/null | sort -n | head -n 1)"
+            now="$(date +%s)"
+            if [ -n "$newest" ]; then
+              echo "  newest entry: $(( (now - newest) / 3600 )) hours old"
+              echo "  oldest entry: $(( (now - oldest) / 86400 )) days old"
+            fi
+            # A maintenance.lock that stays for a long time can make every clone slow.
+            find "$cache" -maxdepth 3 -name maintenance.lock -mmin +60 2>/dev/null | head -n 10 | while IFS= read -r lock_file; do
+              echo "::warning::SwiftPM cache lock older than 60 minutes: $lock_file"
+            done
+          else
+            echo "No SwiftPM cache at $cache: every dependency clones from its remote."
+          fi
+
+          # Resolve apart from the build, to time the clones. The build resolves the
+          # same packages, and finds them ready.
+          resolve_and_time() {
+            local label="$1" started finished
+            shift
+            started="$(date +%s)"
+            swift package "$@" resolve
+            finished="$(date +%s)"
+            echo "::notice title=Resolve time::resolve of $label took $((finished - started)) seconds"
+          }
+          resolve_and_time "the root package"
+          if [ -n "$PB_NESTED" ]; then
+            resolve_and_time "the nested package $PB_NESTED" --package-path "$PB_NESTED"
+          fi
 
       - name: Build tests
         if: inputs.integration-package-path == ''
+        timeout-minutes: ${{ inputs.build-timeout-minutes }}
         run: swift build --build-tests
 
       # Building the nested package also compiles the root package, because
       # the nested package depends on it by a path.
+      - name: Clean the nested build directory
+        if: inputs.integration-package-path != '' && !inputs.persistent-build
+        run: rm -rf '${{ inputs.integration-package-path }}/.build'
+
       - name: Build the nested integration package
         if: inputs.integration-package-path != ''
-        run: |
-          rm -rf '${{ inputs.integration-package-path }}/.build'
-          swift build --package-path '${{ inputs.integration-package-path }}' --build-tests
+        timeout-minutes: ${{ inputs.build-timeout-minutes }}
+        run: swift build --package-path '${{ inputs.integration-package-path }}' --build-tests
 
       # The clean step above removed the root .build, and the nested package
       # build writes its products under the nested .build. Thus a product of
@@ -372,6 +844,7 @@ jobs:
       # the integration suite starts as a subprocess.
       - name: Build the root products the integration suite starts
         if: inputs.integration-root-products != ''
+        timeout-minutes: ${{ inputs.build-timeout-minutes }}
         run: |
           set -euo pipefail
           for product in ${{ inputs.integration-root-products }}; do
@@ -388,12 +861,12 @@ jobs:
         run: |
           set -euo pipefail
           BUILD_DIR='${{ inputs.integration-package-path }}/.build'
-          METALLIB="$(find "$BUILD_DIR" -path '${{ inputs.integration-metallib-glob }}' | head -n 1)"
+          METALLIB="$(find -H "$BUILD_DIR" -path '${{ inputs.integration-metallib-glob }}' | head -n 1)"
           echo "metallib: ${METALLIB:?not found}"
           # mlx probes `<binary-dir>/mlx.metallib` first (measured in
           # FoundationModelsMultitool), and older setups read
           # `default.metallib`. Copy the file under both names.
-          find "$BUILD_DIR" -name '*.xctest' -type d | while read -r XCTEST; do
+          find -H "$BUILD_DIR" -name '*.xctest' -type d | while read -r XCTEST; do
             echo "copy beside: $XCTEST"
             if [ -d "$XCTEST/Contents/MacOS" ]; then
               DEST="$XCTEST/Contents/MacOS"
@@ -406,6 +879,7 @@ jobs:
 
       - name: Run the selected integration tests
         if: inputs.integration-gate-env == ''
+        timeout-minutes: ${{ inputs.integration-timeout-minutes }}
         uses: swissarmyhammer/workflows/.github/actions/swift-test@main
         with:
           package-path: ${{ inputs.integration-package-path }}
@@ -415,14 +889,15 @@ jobs:
 
       - name: Run gated integration suite
         if: inputs.integration-gate-env != ''
+        timeout-minutes: ${{ inputs.integration-timeout-minutes }}
         run: |
           set -euo pipefail
-          XCTEST="$(find .build -path '${{ inputs.integration-xctest-glob }}' -type d | head -n 1)"
+          XCTEST="$(find -H .build -path '${{ inputs.integration-xctest-glob }}' -type d | head -n 1)"
           echo "xctest: ${XCTEST:?not found}"
 
           METALLIB_GLOB='${{ inputs.integration-metallib-glob }}'
           if [ -n "$METALLIB_GLOB" ]; then
-            METALLIB="$(find .build -path "$METALLIB_GLOB" | head -n 1)"
+            METALLIB="$(find -H .build -path "$METALLIB_GLOB" | head -n 1)"
             echo "metallib: ${METALLIB:?not found}"
             cp "$METALLIB" "$XCTEST/Contents/MacOS/" 2>/dev/null \
               || cp "$METALLIB" "$(dirname "$XCTEST")/"
@@ -443,3 +918,23 @@ jobs:
           path: ${{ inputs.integration-artifacts-path }}
           # A run that wrote no file must not fail the job for that.
           if-no-files-found: ignore
+
+      - name: Release the persistent build
+        if: always() && inputs.persistent-build
+        run: |
+          set -euo pipefail
+
+          # Release the lock of this job, and only the lock of this job. A job that never
+          # took the lock leaves the lock of the other job alone.
+          dir="${PB_DIR:-}"
+          if [ -z "$dir" ] || [ ! -f "$dir/lock/owner" ]; then
+            echo "No lock to release."
+            exit 0
+          fi
+          holder="$(cut -d'|' -f3 "$dir/lock/owner")"
+          if [ "$holder" = "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB" ]; then
+            rm -rf "$dir/lock"
+            echo "Released the lock of $dir."
+          else
+            echo "The lock of $dir belongs to $holder: leave it."
+          fi
