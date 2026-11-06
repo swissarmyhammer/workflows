@@ -255,6 +255,12 @@ jobs:
         if: inputs.test-filter == '' && inputs.test-skip == '' && !inputs.test-no-parallel
         timeout-minutes: ${{ inputs.test-timeout-minutes }}
         run: |
+          # The runner's cores, memory and display state, beside any hang.
+          echo "::group::Runner $RUNNER_NAME"
+          echo "cores: $(sysctl -n hw.ncpu) ($(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null) performance), memory: $(( $(sysctl -n hw.memsize) / 1073741824 )) GB"
+          pmset -g 2>/dev/null | grep -Ei 'sleep|displaysleep' || true
+          system_profiler SPDisplaysDataType 2>/dev/null | grep -Ei 'Resolution|Display Type|Online' || echo 'no display'
+          echo "::endgroup::"
           # With test-sample-after-minutes set, a run still going at that point
           # is hung: it records the stacks of its test processes, prints their
           # call graphs into this log (an artifact upload can fail, the log
@@ -289,6 +295,8 @@ jobs:
           path: ${{ runner.temp }}/test-hang-samples
           # A run that finished in time wrote no sample.
           if-no-files-found: ignore
+          # The stacks are in the log too; the files are for the next look only.
+          retention-days: 7
 
       - name: Run the selected tests
         if: inputs.test-filter != '' || inputs.test-skip != '' || inputs.test-no-parallel
