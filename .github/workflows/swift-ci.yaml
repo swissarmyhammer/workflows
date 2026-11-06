@@ -226,6 +226,32 @@ on:
         required: false
         type: string
         default: ""
+      examples:
+        description: >
+          JSON array of example app names, e.g. '["TextPad", "Board"]'. Each
+          name is one leg of the examples job, which runs
+          `./Scripts/test-examples.sh <name>` on the self-hosted runner: the
+          caller's script regenerates the Xcode project, builds the app and
+          runs its UI tests. The UI tests need a logged-in console session of
+          the runner user, an unlocked screen, and UI Automation Mode on for
+          that user. Leave empty to run no examples job.
+        required: false
+        type: string
+        default: ""
+      examples-ios:
+        description: >
+          JSON array of the example names that also build for the iOS
+          simulator, through `./Examples/Scripts/build-example-ios.sh <name>`.
+          Leave empty for none.
+        required: false
+        type: string
+        default: "[]"
+      examples-timeout-minutes:
+        description: >
+          Time limit of each examples leg, in minutes.
+        required: false
+        type: number
+        default: 60
 
 jobs:
   test:
@@ -461,3 +487,75 @@ jobs:
           path: ${{ inputs.integration-artifacts-path }}
           # A run that wrote no file must not fail the job for that.
           if-no-files-found: ignore
+
+  # One leg per example app. The caller's `Scripts/test-examples.sh` holds
+  # the whole gate, so a developer runs the same command locally.
+  examples:
+    name: Examples (${{ matrix.example }})
+    if: inputs.examples != ''
+    runs-on: [self-hosted, macOS]
+    timeout-minutes: ${{ inputs.examples-timeout-minutes }}
+    strategy:
+      fail-fast: false
+      matrix:
+        example: ${{ fromJSON(inputs.examples || '[""]') }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # Xcode 27.2 fails on the prebuilt swift-syntax with `SDK does not
+      # match`, and macro targets need it, so SwiftPM builds it from source.
+      - name: Turn off SwiftPM prebuilts
+        run: defaults write com.apple.dt.Xcode IDEPackageEnablePrebuilts -bool NO
+
+      - name: Toolchain versions
+        run: |
+          sw_vers
+          xcodebuild -version
+          ruby --version
+
+      # The project generators call the `xcodeproj` gem. A gem is per user, so
+      # this installs it into the user gem directory when the runner has none.
+      - name: Install the xcodeproj gem when the runner has none
+        run: |
+          if ruby -e 'require "xcodeproj"' 2>/dev/null; then
+            echo "The xcodeproj gem is available."
+          else
+            echo "The xcodeproj gem is absent. Installing it; this runs one time per runner."
+            gem install --user-install xcodeproj
+            ruby -e 'require "xcodeproj"'
+          fi
+
+      # XCUIApplication activates the app only in the console session with the
+      # screen unlocked. This stops the leg at once when either is not so.
+      - name: Check the UI session of the runner
+        run: |
+          console_user=$(stat -f %Su /dev/console)
+          echo "Runner user: $(whoami). Console user: ${console_user}."
+          if [ "${console_user}" != "$(whoami)" ]; then
+            echo "error: the console belongs to ${console_user}, not to $(whoami). Switch the console of the runner to $(whoami)." >&2
+            exit 1
+          fi
+          if ioreg -n Root -d1 -a | plutil -extract IOConsoleUsers xml1 -o - - 2>/dev/null \
+            | grep -A1 CGSSessionScreenIsLocked | grep -q '<true/>'; then
+            pmset -g || true
+            echo "error: the screen of the runner is locked, so the UI tests cannot activate the app. Turn off the screen lock and the display sleep of $(whoami)." >&2
+            exit 1
+          fi
+
+      - name: Regenerate the project, build the app, and run its UI tests
+        run: ./Scripts/test-examples.sh ${{ matrix.example }}
+
+      - name: Build the app for the iOS simulator
+        if: contains(fromJSON(inputs.examples-ios), matrix.example)
+        run: ./Examples/Scripts/build-example-ios.sh ${{ matrix.example }}
+
+      - name: Upload the result bundles
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: examples-${{ matrix.example }}-results
+          path: .build/examples/${{ matrix.example }}
+          if-no-files-found: ignore
+          # A failure bundle is for the next look, not an archive: the
+          # account's artifact storage is shared and fills up.
+          retention-days: 7
