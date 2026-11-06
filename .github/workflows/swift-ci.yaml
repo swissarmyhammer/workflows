@@ -519,12 +519,40 @@ jobs:
               done
             ) &
             sampler=$!
-            trap 'kill "$sampler" 2>/dev/null || true' EXIT
           fi
+          # Print a line every minute while the tests run, with the age of
+          # the run and the newest test process, so a hang shows which child
+          # runs and for how long. The swift-test action has the same loop.
+          heartbeat() {
+            local interval="$1" started now pid
+            started="$(date +%s)"
+            while sleep "$interval"; do
+              now="$(date +%s)"
+              pid="$(pgrep -n -U "$(id -u)" -f 'swiftpm-testing-helper|xctest' || true)"
+              if [ -n "$pid" ]; then
+                echo "heartbeat $(date +%H:%M:%S): swift test runs for $((now - started)) s; newest test process: $(ps -o pid=,etime=,command= -p "$pid" | cut -c1-200 || true)"
+              else
+                echo "heartbeat $(date +%H:%M:%S): swift test runs for $((now - started)) s; no test helper process runs now"
+              fi
+            done
+          }
+          heartbeat "${SWIFT_TEST_HEARTBEAT_SECONDS:-60}" 2>/dev/null &
+          heartbeat_pid=$!
+          # Stop the sampler and the heartbeat with their `sleep` children, so
+          # no process keeps the step log open after the step ends.
+          stop_helpers() {
+            for helper in ${sampler:-} "$heartbeat_pid"; do
+              pkill -P "$helper" 2>/dev/null || true
+              kill "$helper" 2>/dev/null || true
+            done
+          }
+          trap stop_helpers EXIT
           # `script` gives `swift test` a terminal, so it writes each line at
           # once and not in blocks. `script` ends with the status of
-          # the command, so a failed test still fails the step.
-          script -q /dev/null swift test
+          # the command, so a failed test still fails the step. Standard
+          # input is `/dev/null`, because `script` stops with an error when
+          # standard input is a socket.
+          script -q /dev/null swift test </dev/null
 
       - name: Upload the hang samples
         if: always() && inputs.test-sample-after-minutes > 0
@@ -537,7 +565,10 @@ jobs:
 
       - name: Run the selected tests
         if: inputs.test-filter != '' || inputs.test-skip != '' || inputs.test-no-parallel
-        uses: swissarmyhammer/workflows/.github/actions/swift-test@main
+        # TEMPORARY: this ref is the branch `persistent-build`, so that the
+        # branch test of this workflow runs the branch version of the action.
+        # Change it to `@main` when the branch merges (see docs/swift-ci.md).
+        uses: swissarmyhammer/workflows/.github/actions/swift-test@persistent-build
         with:
           filter: ${{ inputs.test-filter }}
           skip: ${{ inputs.test-skip }}
@@ -880,7 +911,10 @@ jobs:
       - name: Run the selected integration tests
         if: inputs.integration-gate-env == ''
         timeout-minutes: ${{ inputs.integration-timeout-minutes }}
-        uses: swissarmyhammer/workflows/.github/actions/swift-test@main
+        # TEMPORARY: this ref is the branch `persistent-build`, so that the
+        # branch test of this workflow runs the branch version of the action.
+        # Change it to `@main` when the branch merges (see docs/swift-ci.md).
+        uses: swissarmyhammer/workflows/.github/actions/swift-test@persistent-build
         with:
           package-path: ${{ inputs.integration-package-path }}
           filter: ${{ inputs.integration-filter }}

@@ -42,6 +42,15 @@ inputs:
     required: false
     default: ""
 
+  heartbeat-seconds:
+    description: >
+      Seconds between the heartbeat lines that the step prints while
+      `swift test` runs. A heartbeat line shows the age of the run and the
+      newest test process, so a hang shows which child runs and for how long.
+      Set `0` to print no heartbeat.
+    required: false
+    default: "60"
+
 runs:
   using: composite
   steps:
@@ -52,6 +61,7 @@ runs:
         SWIFT_TEST_SKIP: ${{ inputs.skip }}
         SWIFT_TEST_NO_PARALLEL: ${{ inputs.no-parallel }}
         SWIFT_TEST_PACKAGE_PATH: ${{ inputs.package-path }}
+        SWIFT_TEST_HEARTBEAT_SECONDS: ${{ inputs.heartbeat-seconds }}
       run: |
         set -euo pipefail
 
@@ -73,14 +83,48 @@ runs:
         set -- ${args[@]+"${args[@]}"}
         echo "::group::swift test $*"
 
+        # Print a line every interval while the tests run, with the age of the
+        # run and the newest test process, so a hang shows which child runs and
+        # for how long. The line goes to the same log as the test output.
+        heartbeat() {
+          local interval="$1" started now pid
+          started="$(date +%s)"
+          while sleep "$interval"; do
+            now="$(date +%s)"
+            pid="$(pgrep -n -U "$(id -u)" -f 'swiftpm-testing-helper|xctest' || true)"
+            if [ -n "$pid" ]; then
+              echo "heartbeat $(date +%H:%M:%S): swift test runs for $((now - started)) s; newest test process: $(ps -o pid=,etime=,command= -p "$pid" | cut -c1-200 || true)"
+            else
+              echo "heartbeat $(date +%H:%M:%S): swift test runs for $((now - started)) s; no test helper process runs now"
+            fi
+          done
+        }
+
         log="$(mktemp)"
-        trap 'rm -f "$log"' EXIT
+        heartbeat_pid=""
+        # Stop the heartbeat with its `sleep` child, so no process keeps the
+        # step log open after the step ends.
+        stop_heartbeat() {
+          if [ -n "$heartbeat_pid" ]; then
+            pkill -P "$heartbeat_pid" 2>/dev/null || true
+            kill "$heartbeat_pid" 2>/dev/null || true
+          fi
+        }
+        trap 'stop_heartbeat; rm -f "$log"' EXIT
+        interval="${SWIFT_TEST_HEARTBEAT_SECONDS:-60}"
+        if [ "$interval" -gt 0 ]; then
+          heartbeat "$interval" 2>/dev/null &
+          heartbeat_pid=$!
+        fi
 
         # `script` gives `swift test` a terminal, so it writes each line at
         # once and not in blocks, and `script` puts standard error in the same
         # stream. `script` ends with the status of the command, and `pipefail`
-        # above carries that status through `tee`.
-        script -q /dev/null swift test "$@" | tee "$log"
+        # above carries that status through `tee`. Standard input is
+        # `/dev/null`, because `script` stops with an error when standard
+        # input is a socket.
+        script -q /dev/null swift test "$@" </dev/null | tee "$log"
+        stop_heartbeat
         echo "::endgroup::"
 
         # `swift test` answers 0 when the selectors match no test at all: it

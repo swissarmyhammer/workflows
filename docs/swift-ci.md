@@ -261,6 +261,13 @@ A repository that wants a new revision of a pinned dependency commits the new
 
 ## Time limits, the log and the dependency report
 
+**Temporary pin, remove at merge.** A reusable workflow cannot call an action of
+its own repository by a relative path: `./` resolves in the checkout of the
+caller. Thus the two `swift-test` steps of `swift-ci.yaml` call the action with
+`@persistent-build`, the branch of this change, so that a caller of the branch
+runs the branch version of the action. Change both `uses:` lines (each has a
+`TEMPORARY` comment) to `@main` when the branch merges.
+
 Every step that resolves, builds, or generates documentation has
 `timeout-minutes: build-timeout-minutes` (60). The step that runs the
 integration tests has `integration-timeout-minutes` (60). A hung step then fails
@@ -274,6 +281,15 @@ shows the progress while the tests run. `script` ends with the exit status of
 the command, so a failed test still fails the step. The first line of the log
 can start with `^D` and two backspace characters, which `script` writes when
 standard input is not a terminal.
+The steps give `script` `/dev/null` as standard input, because `script` stops
+with an error when standard input is a socket.
+
+While the tests run, the step prints a heartbeat line every 60 seconds. The
+line shows the age of the run and the newest process of `swiftpm-testing-helper`
+or `xctest`, with its pid, its run time and its command. A hang then shows which
+child runs and for how long. A background loop prints the line, and a trap ends
+the loop with the step. The `heartbeat-seconds` input of the `swift-test` action
+changes the interval, and `0` prints no heartbeat.
 
 Before each build, a step reports the SwiftPM cache of the runner
 (`~/Library/Caches/org.swift.swiftpm`): its size, the number of repository
@@ -362,3 +378,4 @@ calling `swift-ci.yaml`.
 | `skip` | `""` | `--skip` selectors, separated by spaces or newlines. |
 | `no-parallel` | `"false"` | Set to `true` to give `--no-parallel`. |
 | `package-path` | `""` | Path given as `--package-path`. Leave empty to test the package in the working directory. |
+| `heartbeat-seconds` | `"60"` | Seconds between the heartbeat lines while the tests run. `0` prints none. |
