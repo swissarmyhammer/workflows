@@ -58,10 +58,11 @@ on:
       test-sample-after-minutes:
         description: >
           When above 0, a plain `swift test` step still running after this many
-          minutes records a `sample` of each test process, and the job uploads
-          them as the artifact test-hang-samples. Set it below
-          test-timeout-minutes so a hang leaves a stack. Defaults to 0, which
-          samples nothing.
+          minutes is taken as hung: it records a `sample` of each test process,
+          prints each call graph into the job log, kills the test processes so
+          the step fails at once, and the job uploads the samples as the
+          artifact test-hang-samples. Set it well above a normal test run and
+          below test-timeout-minutes. Defaults to 0, which samples nothing.
         required: false
         type: number
         default: 0
@@ -255,16 +256,25 @@ jobs:
         timeout-minutes: ${{ inputs.test-timeout-minutes }}
         run: |
           # With test-sample-after-minutes set, a run still going at that point
-          # records the stacks of its test processes, so a hang leaves evidence
-          # for the next step to upload.
+          # is hung: it records the stacks of its test processes, prints their
+          # call graphs into this log (an artifact upload can fail, the log
+          # stays), and kills them, so the job fails then rather than at the
+          # step's timeout.
           sample_after='${{ inputs.test-sample-after-minutes }}'
           if [ "$sample_after" -gt 0 ]; then
             (
               sleep $((sample_after * 60))
               mkdir -p "$RUNNER_TEMP/test-hang-samples"
-              for pid in $(pgrep -U "$(id -u)" -f 'swiftpm-testing-helper|xctest'); do
-                sample "$pid" 5 -file "$RUNNER_TEMP/test-hang-samples/$pid.txt" || true
+              pids=$(pgrep -U "$(id -u)" -f 'swiftpm-testing-helper|xctest')
+              for pid in $pids; do
+                file="$RUNNER_TEMP/test-hang-samples/$pid.txt"
+                sample "$pid" 5 -file "$file" || true
+                echo "::group::Hung test process $pid ($(ps -o comm= -p "$pid" 2>/dev/null))"
+                sed -n '/^Call graph:/,/^Total number in stack/p' "$file" 2>/dev/null || true
+                echo "::endgroup::"
               done
+              echo "::error::swift test still running after $sample_after minutes; sampled and killed its test processes"
+              for pid in $pids; do kill -KILL "$pid" 2>/dev/null || true; done
             ) &
             sampler=$!
             trap 'kill "$sampler" 2>/dev/null || true' EXIT
