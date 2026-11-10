@@ -322,7 +322,7 @@ jobs:
           # A run that finished in time wrote no sample.
           if-no-files-found: ignore
           # The stacks are in the log too; the files are for the next look only.
-          retention-days: 7
+          retention-days: 1
 
       - name: Run the selected tests
         if: inputs.test-filter != '' || inputs.test-skip != '' || inputs.test-no-parallel
@@ -487,6 +487,8 @@ jobs:
           path: ${{ inputs.integration-artifacts-path }}
           # A run that wrote no file must not fail the job for that.
           if-no-files-found: ignore
+          # For the next look only: the artifact storage is shared and fills up.
+          retention-days: 1
 
   # One leg per example app. The caller's `Scripts/test-examples.sh` holds
   # the whole gate, so a developer runs the same command locally.
