@@ -554,8 +554,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: examples-${{ matrix.example }}-results
-          path: .build/examples/${{ matrix.example }}
+          # Only the result bundles. The folder also holds the DerivedData of
+          # the leg, which is gigabytes and fills the artifact storage.
+          path: .build/examples/${{ matrix.example }}/*.xcresult
           if-no-files-found: ignore
           # A failure bundle is for the next look, not an archive: the
           # account's artifact storage is shared and fills up.
-          retention-days: 7
+          retention-days: 1
