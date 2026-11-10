@@ -237,8 +237,11 @@ on:
           directory at the same time. The directory is cleaned when the
           toolchain, a Package.swift file, or a tracked Package.resolved file
           changed since the last run, when it is older than
-          build-max-age-days, and when clean-build is true. Leave false to
-          remove `.build` and build everything on each run, exactly as before.
+          build-max-age-days, and when clean-build is true. A package with no
+          tracked Package.resolved file is updated to the head of each branch
+          dependency on each run, so a kept checkout never stays on an old
+          revision. Leave false to remove `.build` and build everything on each
+          run, exactly as before.
         required: false
         type: boolean
         default: false
@@ -483,17 +486,29 @@ jobs:
 
           # Resolve apart from the build, to time the clones. The build resolves the
           # same packages, and finds them ready.
+          #
+          # A package with no Package.resolved file tracks its dependencies by
+          # branch (the checkout's clean removes an untracked one). A fresh `.build`
+          # resolves each branch to its head. A kept `.build` does not:
+          # `swift package resolve` takes the revisions that are already checked out
+          # there, so a persistent build compiles against old dependency revisions,
+          # and the fingerprint never sees the move. `swift package update` resolves
+          # each branch to its head, as a fresh `.build` does. A tracked
+          # Package.resolved is a pin, and `resolve` keeps it.
           resolve_and_time() {
-            local label="$1" started finished
-            shift
+            local label="$1" dir="$2" verb=resolve started finished
+            shift 2
+            if [ ! -f "$dir/Package.resolved" ]; then
+              verb=update
+            fi
             started="$(date +%s)"
-            swift package "$@" resolve
+            swift package "$@" "$verb"
             finished="$(date +%s)"
-            echo "::notice title=Resolve time::resolve of $label took $((finished - started)) seconds"
+            echo "::notice title=Resolve time::$verb of $label took $((finished - started)) seconds"
           }
-          resolve_and_time "the root package"
+          resolve_and_time "the root package" .
           if [ -n "$PB_NESTED" ]; then
-            resolve_and_time "the nested package $PB_NESTED" --package-path "$PB_NESTED"
+            resolve_and_time "the nested package $PB_NESTED" "$PB_NESTED" --package-path "$PB_NESTED"
           fi
 
       - name: Build (incl. tests)
@@ -840,17 +855,29 @@ jobs:
 
           # Resolve apart from the build, to time the clones. The build resolves the
           # same packages, and finds them ready.
+          #
+          # A package with no Package.resolved file tracks its dependencies by
+          # branch (the checkout's clean removes an untracked one). A fresh `.build`
+          # resolves each branch to its head. A kept `.build` does not:
+          # `swift package resolve` takes the revisions that are already checked out
+          # there, so a persistent build compiles against old dependency revisions,
+          # and the fingerprint never sees the move. `swift package update` resolves
+          # each branch to its head, as a fresh `.build` does. A tracked
+          # Package.resolved is a pin, and `resolve` keeps it.
           resolve_and_time() {
-            local label="$1" started finished
-            shift
+            local label="$1" dir="$2" verb=resolve started finished
+            shift 2
+            if [ ! -f "$dir/Package.resolved" ]; then
+              verb=update
+            fi
             started="$(date +%s)"
-            swift package "$@" resolve
+            swift package "$@" "$verb"
             finished="$(date +%s)"
-            echo "::notice title=Resolve time::resolve of $label took $((finished - started)) seconds"
+            echo "::notice title=Resolve time::$verb of $label took $((finished - started)) seconds"
           }
-          resolve_and_time "the root package"
+          resolve_and_time "the root package" .
           if [ -n "$PB_NESTED" ]; then
-            resolve_and_time "the nested package $PB_NESTED" --package-path "$PB_NESTED"
+            resolve_and_time "the nested package $PB_NESTED" "$PB_NESTED" --package-path "$PB_NESTED"
           fi
 
       - name: Build tests
