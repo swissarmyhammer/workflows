@@ -161,6 +161,17 @@ on:
         required: false
         type: string
         default: ""
+      integration-runs-on:
+        description: >
+          JSON array of the runner labels the integration job asks for (e.g.
+          '["self-hosted","macOS","large-memory"]'). GitHub gives the job
+          only to a runner that has every label. Set this for a suite that
+          needs a runner with more memory than some runners of the pool have,
+          such as a real-model suite. The unit and example jobs keep the
+          default labels, so they still run on any runner.
+        required: false
+        type: string
+        default: '["self-hosted","macOS"]'
       integration-root-products:
         description: >
           Whitespace-separated list of product names of the ROOT package to
@@ -375,7 +386,7 @@ jobs:
       || inputs.integration-filter != ''
       || inputs.integration-skip != ''
       || inputs.integration-package-path != ''
-    runs-on: [self-hosted, macOS]
+    runs-on: ${{ fromJSON(inputs.integration-runs-on) }}
     steps:
       - uses: actions/checkout@v7
 

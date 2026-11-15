@@ -118,6 +118,27 @@ jobs:
 The unit job needs no such input. Its `swift build --build-tests` at the root
 builds every product of the root manifest.
 
+## A suite that needs a large runner
+
+The runners of the pool do not all have the same memory. A real-model suite
+can need more than the smallest runner has. Give the large runners a label of
+their own, such as `large-memory`, and set `integration-runs-on` to the labels
+the integration job asks for. GitHub gives the job only to a runner that has
+every label in the list.
+
+```yaml
+jobs:
+  ci:
+    uses: swissarmyhammer/workflows/.github/workflows/swift-ci.yaml@main
+    with:
+      integration-package-path: IntegrationTests
+      integration-runs-on: '["self-hosted","macOS","large-memory"]'
+```
+
+The unit and example jobs keep `[self-hosted, macOS]`, so they still run on
+any runner. When every large runner is busy, the integration job waits for
+one.
+
 ## `swift test` exits 0 when it matches nothing
 
 `swift test` writes `warning: No matching test cases were run` and exits 0 when
@@ -163,6 +184,7 @@ runs `swift test` with no selectors.
 | `integration-package-path` | string | `""` | Path to a nested integration package. Setting this runs the integration job. |
 | `integration-metallib-glob` | string | `""` | `find(1)` glob that finds a `default.metallib` to copy next to the `.xctest` bundles. |
 | `integration-root-products` | string | `""` | Names of products of the ROOT package that the integration job builds at the repository root, before the tests run. Set this for a suite that starts one of them as a subprocess. |
+| `integration-runs-on` | string | `'["self-hosted","macOS"]'` | JSON array of the runner labels the integration job asks for. Set it to send the job only to runners with a label of their own, such as `large-memory`. |
 | `integration-artifacts-path` | string | `""` | Path that the integration job uploads as an artifact after the tests. Setting this keeps the forensic files of a failed run. |
 | `example-targets` | string | `""` | Names of more executable targets to build one by one. |
 | `docc-target` | string | `""` | Name of a library target to build a DocC catalog for. |
