@@ -263,11 +263,30 @@ on:
         required: false
         type: number
         default: 60
+      job-timeout-minutes:
+        description: >
+          Time limit of the Build & test job and of the integration job, in
+          minutes. A job that stops (for example a dependency download that
+          receives no bytes) then frees the shared runner. The default of
+          GitHub is 360 minutes.
+        required: false
+        type: number
+        default: 180
+
+# SwiftPM uses git to get each dependency and its submodules. A git transfer
+# that receives no data waits with no limit, and the job then holds the
+# runner for hours. These values stop a git transfer that is slower than
+# 1000 bytes each second for 60 seconds, thus the step fails in place of a
+# hang.
+env:
+  GIT_HTTP_LOW_SPEED_LIMIT: "1000"
+  GIT_HTTP_LOW_SPEED_TIME: "60"
 
 jobs:
   test:
     name: Build & test
     runs-on: [self-hosted, macOS]
+    timeout-minutes: ${{ inputs.job-timeout-minutes }}
     steps:
       - uses: actions/checkout@v7
 
@@ -387,6 +406,7 @@ jobs:
       || inputs.integration-skip != ''
       || inputs.integration-package-path != ''
     runs-on: ${{ fromJSON(inputs.integration-runs-on) }}
+    timeout-minutes: ${{ inputs.job-timeout-minutes }}
     steps:
       - uses: actions/checkout@v7
 

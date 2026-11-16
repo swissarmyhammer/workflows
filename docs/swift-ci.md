@@ -185,6 +185,7 @@ runs `swift test` with no selectors.
 | `integration-metallib-glob` | string | `""` | `find(1)` glob that finds a `default.metallib` to copy next to the `.xctest` bundles. |
 | `integration-root-products` | string | `""` | Names of products of the ROOT package that the integration job builds at the repository root, before the tests run. Set this for a suite that starts one of them as a subprocess. |
 | `integration-runs-on` | string | `'["self-hosted","macOS"]'` | JSON array of the runner labels the integration job asks for. Set it to send the job only to runners with a label of their own, such as `large-memory`. |
+| `job-timeout-minutes` | number | `180` | Time limit of the Build & test job and of the integration job, in minutes. A job that stops then frees the shared runner. The workflow also sets `GIT_HTTP_LOW_SPEED_LIMIT=1000` and `GIT_HTTP_LOW_SPEED_TIME=60`, thus a git transfer of a dependency that gets no data fails after 60 seconds. |
 | `integration-artifacts-path` | string | `""` | Path that the integration job uploads as an artifact after the tests. Setting this keeps the forensic files of a failed run. |
 | `example-targets` | string | `""` | Names of more executable targets to build one by one. |
 | `docc-target` | string | `""` | Name of a library target to build a DocC catalog for. |
