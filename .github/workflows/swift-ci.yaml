@@ -146,6 +146,27 @@ on:
         required: false
         type: boolean
         default: false
+      integration-timeout-minutes:
+        description: >
+          Time limit, in minutes, of the step that runs the selected
+          integration tests. A hung run then fails at this limit in place of
+          holding the runner until the job limit. Defaults to GitHub's own
+          limit of a step, so a caller that does not set it sees no change.
+        required: false
+        type: number
+        default: 360
+      integration-sample-after-minutes:
+        description: >
+          When above 0, a run of the selected integration tests that is still
+          going after this many minutes is taken as hung, in the same way as
+          test-sample-after-minutes: the step samples the test processes,
+          prints each call graph into the job log, kills them, and the job
+          uploads the samples as the artifact integration-hang-samples. Set it
+          well above a normal integration run and below
+          integration-timeout-minutes. Defaults to 0, which samples nothing.
+        required: false
+        type: number
+        default: 0
       integration-package-path:
         description: >
           Path, relative to the repository root, to a nested package that
@@ -481,12 +502,25 @@ jobs:
 
       - name: Run the selected integration tests
         if: inputs.integration-gate-env == ''
+        timeout-minutes: ${{ inputs.integration-timeout-minutes }}
         uses: swissarmyhammer/workflows/.github/actions/swift-test@main
         with:
           package-path: ${{ inputs.integration-package-path }}
           filter: ${{ inputs.integration-filter }}
           skip: ${{ inputs.integration-skip }}
           no-parallel: ${{ inputs.integration-no-parallel }}
+          sample-after-minutes: ${{ inputs.integration-sample-after-minutes }}
+
+      - name: Upload the integration hang samples
+        if: always() && inputs.integration-gate-env == '' && inputs.integration-sample-after-minutes > 0
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-hang-samples
+          path: ${{ runner.temp }}/test-hang-samples
+          # A run that finished in time wrote no sample.
+          if-no-files-found: ignore
+          # The stacks are in the log too; the files are for the next look only.
+          retention-days: 1
 
       - name: Run gated integration suite
         if: inputs.integration-gate-env != ''

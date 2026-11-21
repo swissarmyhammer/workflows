@@ -41,6 +41,16 @@ inputs:
       directory.
     required: false
     default: ""
+  sample-after-minutes:
+    description: >
+      When above 0, a run of `swift test` that is still going after this many
+      minutes is taken as hung: the step records a `sample` of each test
+      process into `$RUNNER_TEMP/test-hang-samples`, prints each call graph
+      into the job log, and kills the test processes, so the step fails at
+      once. Set it well above a normal run. Defaults to 0, which samples
+      nothing.
+    required: false
+    default: "0"
 
 runs:
   using: composite
@@ -52,6 +62,7 @@ runs:
         SWIFT_TEST_SKIP: ${{ inputs.skip }}
         SWIFT_TEST_NO_PARALLEL: ${{ inputs.no-parallel }}
         SWIFT_TEST_PACKAGE_PATH: ${{ inputs.package-path }}
+        SWIFT_TEST_SAMPLE_AFTER_MINUTES: ${{ inputs.sample-after-minutes }}
       run: |
         set -euo pipefail
 
@@ -74,7 +85,31 @@ runs:
         echo "::group::swift test $*"
 
         log="$(mktemp)"
-        trap 'rm -f "$log"' EXIT
+        sampler=""
+        trap 'rm -f "$log"; if [ -n "$sampler" ]; then kill "$sampler" 2>/dev/null || true; fi' EXIT
+
+        # With sample-after-minutes set, a run still going at that point is
+        # hung: record the stacks of its test processes, print their call
+        # graphs into this log (an artifact upload can fail, the log stays),
+        # and kill them, so the step fails then rather than at its time limit.
+        sample_after="${SWIFT_TEST_SAMPLE_AFTER_MINUTES:-0}"
+        if [ "$sample_after" -gt 0 ]; then
+          (
+            sleep $((sample_after * 60))
+            mkdir -p "$RUNNER_TEMP/test-hang-samples"
+            pids=$(pgrep -U "$(id -u)" -f 'swiftpm-testing-helper|xctest' || true)
+            for pid in $pids; do
+              file="$RUNNER_TEMP/test-hang-samples/$pid.txt"
+              sample "$pid" 5 -file "$file" || true
+              echo "::group::Hung test process $pid ($(ps -o comm= -p "$pid" 2>/dev/null))"
+              sed -n '/^Call graph:/,/^Total number in stack/p' "$file" 2>/dev/null || true
+              echo "::endgroup::"
+            done
+            echo "::error::swift test still running after $sample_after minutes; sampled and killed its test processes"
+            for pid in $pids; do kill -KILL "$pid" 2>/dev/null || true; done
+          ) &
+          sampler=$!
+        fi
 
         # `pipefail` above is what carries a failure of `swift test` through
         # `tee`.
