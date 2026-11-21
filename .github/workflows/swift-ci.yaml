@@ -299,9 +299,21 @@ on:
 # runner for hours. These values stop a git transfer that is slower than
 # 1000 bytes each second for 60 seconds, thus the step fails in place of a
 # hang.
+#
+# SwiftPM fetches each dependency into its cache repository, then copies that
+# repository into .build. After each fetch, git starts `git maintenance run
+# --auto`. By default that process detaches and holds
+# objects/maintenance.lock after `git fetch` returns. The copy then finds the
+# lock file gone, SwiftPM writes "skipping cache due to an error: The file
+# “maintenance.lock” doesn’t exist", and it clones the dependency from the
+# network. With maintenance.autoDetach false, the maintenance completes before
+# `git fetch` returns, thus the copy gets a repository with no lock file.
 env:
   GIT_HTTP_LOW_SPEED_LIMIT: "1000"
   GIT_HTTP_LOW_SPEED_TIME: "60"
+  GIT_CONFIG_COUNT: "1"
+  GIT_CONFIG_KEY_0: maintenance.autoDetach
+  GIT_CONFIG_VALUE_0: "false"
 
 jobs:
   test:
